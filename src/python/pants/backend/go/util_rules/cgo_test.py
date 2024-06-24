@@ -68,7 +68,12 @@ def rule_runner() -> RuleRunner:
             QueryRule(CGoCompileResult, [CGoCompileRequest]),
             QueryRule(ProcessResult, (Process,)),
         ],
-        target_types=[GoModTarget, GoPackageTarget, GoBinaryTarget, ResourceTarget],
+        target_types=[
+            GoModTarget,
+            GoPackageTarget,
+            GoBinaryTarget,
+            ResourceTarget,
+        ],
     )
     rule_runner.set_options(
         [

@@ -11,7 +11,8 @@ from pants.build_graph.address import Address
 from pants.engine.rules import collect_rules, rule
 from pants.engine.target import AllTargets, Targets
 from pants.jvm.dependency_inference.jvm_artifact_mappings import JVM_ARTIFACT_MAPPINGS
-from pants.jvm.resolve.common import ArtifactRequirement, Coordinate
+from pants.jvm.resolve.common import ArtifactRequirement
+from pants.jvm.resolve.coordinate import Coordinate
 from pants.jvm.subsystems import JvmSubsystem
 from pants.jvm.target_types import (
     JvmArtifactArtifactField,
@@ -23,7 +24,6 @@ from pants.jvm.target_types import (
 from pants.util.docutil import bin_name
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
-from pants.util.meta import frozen_after_init
 from pants.util.ordered_set import FrozenOrderedSet, OrderedSet
 
 _ResolveName = str
@@ -68,7 +68,7 @@ class MutableTrieNode:
         "first_party",
     ]  # don't use a `dict` to store attrs
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.children: dict[str, MutableTrieNode] = {}
         self.recursive: bool = False
         self.addresses: dict[SymbolNamespace, OrderedSet[Address]] = defaultdict(OrderedSet)
@@ -107,26 +107,35 @@ class MutableTrieNode:
 FrozenTrieNodeItem = Tuple[str, bool, FrozenDict[SymbolNamespace, FrozenOrderedSet[Address]], bool]
 
 
-@frozen_after_init
+@dataclass(frozen=True)
 class FrozenTrieNode:
     __slots__ = [
-        "_is_frozen",
         "_children",
         "_recursive",
         "_addresses",
         "_first_party",
     ]  # don't use a `dict` to store attrs (speeds up attr access significantly)
 
+    _children: FrozenDict[str, FrozenTrieNode]
+    _recursive: bool
+    _addresses: FrozenDict[SymbolNamespace, FrozenOrderedSet[Address]]
+    _first_party: bool
+
     def __init__(self, node: MutableTrieNode) -> None:
         children = {}
         for key, child in node.children.items():
             children[key] = FrozenTrieNode(child)
-        self._children: FrozenDict[str, FrozenTrieNode] = FrozenDict(children)
-        self._recursive: bool = node.recursive
-        self._addresses: FrozenDict[SymbolNamespace, FrozenOrderedSet[Address]] = FrozenDict(
-            {ns: FrozenOrderedSet(addresses) for ns, addresses in node.addresses.items()}
+
+        object.__setattr__(self, "_children", FrozenDict(children))
+        object.__setattr__(self, "_recursive", node.recursive)
+        object.__setattr__(
+            self,
+            "_addresses",
+            FrozenDict(
+                {ns: FrozenOrderedSet(addresses) for ns, addresses in node.addresses.items()}
+            ),
         )
-        self._first_party: bool = node.first_party
+        object.__setattr__(self, "_first_party", node.first_party)
 
     def find_child(self, name: str) -> FrozenTrieNode | None:
         return self._children.get(name)

@@ -4,15 +4,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
+from pants.backend.scala.subsystems.scala import ScalaSubsystem
 from pants.backend.scala.subsystems.scala_infer import ScalaInferSubsystem
+from pants.backend.scala.util_rules.versions import ScalaCrossVersionMode
+from pants.build_graph.address import AddressInput
+from pants.build_graph.build_file_aliases import BuildFileAliases
 from pants.core.goals.test import TestExtraEnvVarsField, TestTimeoutField
+from pants.engine.addresses import Address
 from pants.engine.rules import collect_rules, rule
 from pants.engine.target import (
     COMMON_TARGET_FIELDS,
     AsyncFieldMixin,
     Dependencies,
     FieldSet,
+    GeneratedTargets,
+    GenerateTargetsRequest,
     MultipleSourcesField,
     OverridesField,
     SingleSourceField,
@@ -22,22 +30,35 @@ from pants.engine.target import (
     TargetFilesGenerator,
     TargetFilesGeneratorSettings,
     TargetFilesGeneratorSettingsRequest,
+    TargetGenerator,
     generate_file_based_overrides_field_help_message,
     generate_multiple_sources_field_help_message,
 )
-from pants.engine.unions import UnionRule
+from pants.engine.unions import UnionMembership, UnionRule
 from pants.jvm import target_types as jvm_target_types
+from pants.jvm.subsystems import JvmSubsystem
 from pants.jvm.target_types import (
     JunitTestExtraEnvVarsField,
     JunitTestSourceField,
     JunitTestTimeoutField,
+    JvmArtifactArtifactField,
+    JvmArtifactExclusion,
+    JvmArtifactExclusionsField,
+    JvmArtifactGroupField,
+    JvmArtifactJarSourceField,
+    JvmArtifactPackagesField,
+    JvmArtifactResolveField,
+    JvmArtifactTarget,
+    JvmArtifactUrlField,
+    JvmArtifactVersionField,
     JvmJdkField,
     JvmMainClassNameField,
     JvmProvidesTypesField,
     JvmResolveField,
     JvmRunnableSourceFieldSet,
+    _jvm_artifact_exclusions_field_help,
 )
-from pants.util.strutil import softwrap
+from pants.util.strutil import help_text, softwrap
 
 
 class ScalaSettingsRequest(TargetFilesGeneratorSettingsRequest):
@@ -67,7 +88,7 @@ class ScalaDependenciesField(Dependencies):
 
 
 class ScalaConsumedPluginNamesField(StringSequenceField):
-    help = softwrap(
+    help = help_text(
         """
         The names of Scala plugins that this source file requires.
 
@@ -169,10 +190,10 @@ class ScalatestTestsGeneratorTarget(TargetFilesGenerator):
         JvmResolveField,
     )
     settings_request_cls = ScalaSettingsRequest
-    help = softwrap(
+    help = help_text(
         f"""
         Generate a `scalatest_test` target for each file in the `sources` field (defaults to
-        all files in the directory matching {ScalatestTestsGeneratorSourcesField.default}).
+        all files in the directory matching `{ScalatestTestsGeneratorSourcesField.default}`).
         """
     )
 
@@ -324,12 +345,21 @@ class ScalacPluginArtifactField(StringField, AsyncFieldMixin):
     alias = "artifact"
     required = True
     value: str
-    help = "The address of a `jvm_artifact` that defines a plugin for `scalac`."
+    help = "The address of either a `jvm_artifact` or a `scala_artifact` that defines a plugin for `scalac`."
+
+    def to_address_input(self) -> AddressInput:
+        return AddressInput.parse(
+            self.value,
+            relative_to=self.address.spec_path,
+            description_of_origin=(
+                f"the `{self.alias}` field in the `{ScalacPluginTarget.alias}` target {self.address}"
+            ),
+        )
 
 
 class ScalacPluginNameField(StringField):
     alias = "plugin_name"
-    help = softwrap(
+    help = help_text(
         """
         The name that `scalac` should use to load the plugin.
 
@@ -345,7 +375,7 @@ class ScalacPluginTarget(Target):
         ScalacPluginArtifactField,
         ScalacPluginNameField,
     )
-    help = softwrap(
+    help = help_text(
         """
         A plugin for `scalac`.
 
@@ -359,10 +389,209 @@ class ScalacPluginTarget(Target):
     )
 
 
+# -----------------------------------------------------------------------------------------------
+# `scala_artifact` target
+# -----------------------------------------------------------------------------------------------
+
+
+# Defining this field and making it required in the `ScalaArtifactFieldSet`
+# prevents the `JvmArtifactFieldSet` matching against `scala_artifact` targets
+# and raising an error when resolving a classpath in which such targets have been
+# used as explicit dependencies of other targets.
+#
+# This way classpath entries for `scala_artifact` targets will be resolved using
+# their own rules, bringing the actual JAR dependency as a transitive one.
+class ScalaArtifactArtifactField(StringField):
+    alias = "artifact"
+    required = True
+    value: str
+    help = help_text(
+        """
+        The 'artifact' part of a Maven-compatible Scala-versioned coordinate to a third-party JAR artifact.
+
+        For the JAR coordinate `org.typelevel:cats-core_2.13:2.9.0`, the artifact is `cats-core`.
+        """
+    )
+
+
+class ScalaArtifactCrossversionField(StringField):
+    alias = "crossversion"
+    default = ScalaCrossVersionMode.BINARY.value
+    help = help_text(
+        f"""
+        Whether to use the full Scala version or the partial one to determine the artifact name suffix.
+
+        Default is `{ScalaCrossVersionMode.BINARY.value}`.
+        """
+    )
+    valid_choices = ScalaCrossVersionMode
+
+
+@dataclass(frozen=True)
+class ScalaArtifactExclusion(JvmArtifactExclusion):
+    alias = "scala_exclude"
+    help = help_text(
+        """
+        Exclude the given `artifact` and `group`, or all artifacts from the given `group`.
+        You can also use the `crossversion` field to help resolve the final artifact name.
+        """
+    )
+
+    crossversion: str = ScalaCrossVersionMode.BINARY.value
+
+    def validate(self, address: Address) -> set[str]:
+        errors = super().validate(address)
+        valid_crossversions = [x.value for x in ScalaCrossVersionMode]
+        if self.crossversion not in valid_crossversions:
+            errors.add(
+                softwrap(
+                    f"""
+                    Invalid `crossversion` value '{self.crossversion}' in in list of
+                    exclusions at target: {address}. Valid values are:
+                    {', '.join(valid_crossversions)}
+                    """
+                )
+            )
+        return errors
+
+
+class ScalaArtifactExclusionsField(JvmArtifactExclusionsField):
+    help = _jvm_artifact_exclusions_field_help(
+        lambda: ScalaArtifactExclusionsField.supported_exclusion_types
+    )
+    supported_exclusion_types: ClassVar[tuple[type[JvmArtifactExclusion], ...]] = (
+        JvmArtifactExclusion,
+        ScalaArtifactExclusion,
+    )
+
+
+@dataclass(frozen=True)
+class ScalaArtifactFieldSet(FieldSet):
+    group: JvmArtifactGroupField
+    artifact: ScalaArtifactArtifactField
+    version: JvmArtifactVersionField
+    packages: JvmArtifactPackagesField
+    exclusions: ScalaArtifactExclusionsField
+    crossversion: ScalaArtifactCrossversionField
+
+    required_fields = (
+        JvmArtifactGroupField,
+        ScalaArtifactArtifactField,
+        JvmArtifactVersionField,
+        JvmArtifactPackagesField,
+        ScalaArtifactCrossversionField,
+    )
+
+
+class ScalaArtifactTarget(TargetGenerator):
+    alias = "scala_artifact"
+    help = help_text(
+        """
+        A third-party Scala artifact, as identified by its Maven-compatible coordinate.
+
+        That is, an artifact identified by its `group`, `artifact`, and `version` components.
+
+        Each artifact is associated with one or more resolves (a logical name you give to a
+        lockfile). For this artifact to be used by your first-party code, it must be
+        associated with the resolve(s) used by that code. See the `resolve` field.
+
+        Being a Scala artifact, the final artifact name will be inferred using the Scala version
+        configured for the given resolve.
+        """
+    )
+    core_fields = (
+        *COMMON_TARGET_FIELDS,
+        *ScalaArtifactFieldSet.required_fields,
+        ScalaArtifactExclusionsField,
+        JvmArtifactUrlField,
+        JvmArtifactJarSourceField,
+        JvmMainClassNameField,
+    )
+    copied_fields = (
+        *COMMON_TARGET_FIELDS,
+        JvmArtifactGroupField,
+        JvmArtifactVersionField,
+        JvmArtifactPackagesField,
+        JvmArtifactUrlField,
+        JvmArtifactJarSourceField,
+        JvmMainClassNameField,
+    )
+    moved_fields = (
+        JvmArtifactResolveField,
+        JvmJdkField,
+    )
+
+
+class GenerateJvmArtifactForScalaTargets(GenerateTargetsRequest):
+    generate_from = ScalaArtifactTarget
+
+
+@rule
+async def generate_jvm_artifact_targets(
+    request: GenerateJvmArtifactForScalaTargets,
+    jvm: JvmSubsystem,
+    scala: ScalaSubsystem,
+    union_membership: UnionMembership,
+) -> GeneratedTargets:
+    field_set = ScalaArtifactFieldSet.create(request.generator)
+    resolve_name = request.template.get(JvmArtifactResolveField.alias) or jvm.default_resolve
+    scala_version = scala.version_for_resolve(resolve_name)
+
+    exclusions_field = {}
+    if field_set.exclusions.value:
+        exclusions = []
+        for exclusion in field_set.exclusions.value:
+            if not isinstance(exclusion, ScalaArtifactExclusion):
+                exclusions.append(exclusion)
+            else:
+                excluded_artifact_name = None
+                if exclusion.artifact:
+                    cross_mode = ScalaCrossVersionMode(exclusion.crossversion)
+                    excluded_artifact_name = (
+                        f"{exclusion.artifact}_{scala_version.crossversion(cross_mode)}"
+                    )
+                exclusions.append(
+                    JvmArtifactExclusion(group=exclusion.group, artifact=excluded_artifact_name)
+                )
+        exclusions_field[JvmArtifactExclusionsField.alias] = exclusions
+
+    cross_mode = ScalaCrossVersionMode(
+        field_set.crossversion.value or ScalaArtifactCrossversionField.default
+    )
+    artifact_name = f"{field_set.artifact.value}_{scala_version.crossversion(cross_mode)}"
+    jvm_artifact_target = JvmArtifactTarget(
+        {
+            **request.template,
+            JvmArtifactArtifactField.alias: artifact_name,
+            **exclusions_field,
+        },
+        request.generator.address.create_generated(artifact_name),
+        union_membership,
+        residence_dir=request.generator.address.spec_path,
+    )
+
+    return GeneratedTargets(request.generator, (jvm_artifact_target,))
+
+
+SCALA_SOURCES_TARGET_TYPES: list[type[Target]] = [
+    ScalaSourceTarget,
+    ScalaSourcesGeneratorTarget,
+    ScalatestTestTarget,
+    ScalatestTestsGeneratorTarget,
+    ScalaJunitTestTarget,
+    ScalaJunitTestsGeneratorTarget,
+]
+
+
 def rules():
     return (
         *collect_rules(),
         *jvm_target_types.rules(),
         *ScalaFieldSet.jvm_rules(),
         UnionRule(TargetFilesGeneratorSettingsRequest, ScalaSettingsRequest),
+        UnionRule(GenerateTargetsRequest, GenerateJvmArtifactForScalaTargets),
     )
+
+
+def build_file_aliases():
+    return BuildFileAliases(objects={ScalaArtifactExclusion.alias: ScalaArtifactExclusion})

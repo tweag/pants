@@ -8,8 +8,8 @@ from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any
 
-from ruamel.yaml import YAML
-from ruamel.yaml.compat import StringIO
+from ruamel.yaml import YAML  # pants: no-infer-dep
+from ruamel.yaml.compat import StringIO  # pants: no-infer-dep
 from yamlpath import Processor  # pants: no-infer-dep
 from yamlpath.common import Parsers  # pants: no-infer-dep
 from yamlpath.exceptions import YAMLPathException  # pants: no-infer-dep
@@ -38,7 +38,7 @@ def build_manifest_map(input_file: str) -> dict[str, list[str]]:
 
     result = defaultdict(list)
     template_files = []
-    with open(input_file, "r", encoding="utf-8") as f:
+    with open(input_file, encoding="utf-8") as f:
         template_files = f.read().split("---")
 
     for template in template_files:

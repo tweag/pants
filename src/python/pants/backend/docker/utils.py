@@ -4,14 +4,11 @@
 from __future__ import annotations
 
 import difflib
-import hashlib
-import json
 import os.path
-from collections import abc
-from dataclasses import asdict, is_dataclass
 from fnmatch import fnmatch
-from functools import partial
-from typing import Any, Callable, Iterable, Iterator, Sequence, TypeVar
+from typing import Callable, Iterable, Iterator, Sequence, TypeVar
+
+from typing_extensions import Self
 
 from pants.help.maybe_color import MaybeColor
 from pants.util.ordered_set import FrozenOrderedSet
@@ -56,6 +53,15 @@ class KeyValueSequenceUtil(FrozenOrderedSet[str]):
             entry_and_value[0] for entry_and_value in key_to_entry_and_value.values()
         )
         return cls(FrozenOrderedSet(deduped_entries))
+
+    @classmethod
+    def from_dict(cls, value: dict[str, str | None]) -> Self:
+        def encode_kv(k: str, v: str | None) -> str:
+            if v is None:
+                return k
+            return "=".join((k, v))
+
+        return cls(FrozenOrderedSet(sorted(encode_kv(k, v) for k, v in value.items())))
 
     def to_dict(
         self, default: Callable[[str], str | None] = lambda x: None
@@ -169,30 +175,3 @@ def format_rename_suggestion(src_path: str, dst_path: str, *, colors: bool) -> s
     rem = color.maybe_red(src_path)
     add = color.maybe_green(dst_path)
     return f"{rem} => {add}"
-
-
-class JsonEncoder(json.JSONEncoder):
-    """Allow us to serialize everything, with a fallback on `str()` in case of any esoteric
-    types."""
-
-    def default(self, o):
-        """Return a serializable object for o."""
-        if is_dataclass(o):
-            return asdict(o)
-        if isinstance(o, abc.Mapping):
-            return dict(o)
-        if isinstance(o, abc.Sequence):
-            return list(o)
-        try:
-            return super().default(o)
-        except TypeError:
-            return str(o)
-
-
-json_dumps = partial(
-    json.dumps, indent=None, separators=(",", ":"), sort_keys=True, cls=JsonEncoder
-)
-
-
-def get_hash(value: Any, *, name: str = "sha256") -> hashlib._Hash:
-    return hashlib.new(name, json_dumps(value).encode("utf-8"))

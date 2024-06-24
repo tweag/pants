@@ -2,32 +2,33 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
 from pants.build_graph.address import Address, AddressInput
 from pants.core.goals.generate_lockfiles import DEFAULT_TOOL_LOCKFILE, GenerateToolLockfileSentinel
+from pants.core.goals.resolves import ExportableTool
 from pants.engine.addresses import Addresses
 from pants.engine.internals.selectors import Get, MultiGet
 from pants.engine.rules import collect_rules, rule
 from pants.engine.target import Targets
-from pants.jvm.goals import lockfile
-from pants.jvm.goals.lockfile import GenerateJvmLockfile
 from pants.jvm.resolve.common import (
     ArtifactRequirement,
     ArtifactRequirements,
-    Coordinate,
     GatherJvmCoordinatesRequest,
 )
+from pants.jvm.resolve.coordinate import Coordinate
 from pants.jvm.target_types import JvmArtifactFieldSet
 from pants.option.option_types import StrListOption, StrOption
 from pants.option.subsystem import Subsystem
-from pants.util.docutil import bin_name
+from pants.util.docutil import bin_name, git_url
+from pants.util.meta import classproperty
 from pants.util.ordered_set import FrozenOrderedSet
 from pants.util.strutil import softwrap
 
 
-class JvmToolBase(Subsystem):
+class JvmToolBase(Subsystem, ExportableTool):
     """Base class for subsystems that configure a set of artifact requirements for a JVM tool."""
 
     # Default version of the tool. (Subclasses may set.)
@@ -39,8 +40,6 @@ class JvmToolBase(Subsystem):
 
     # Default resource for the tool's lockfile. (Subclasses must set.)
     default_lockfile_resource: ClassVar[tuple[str, str]]
-
-    default_lockfile_url: ClassVar[str | None] = None
 
     version = StrOption(
         advanced=True,
@@ -58,7 +57,7 @@ class JvmToolBase(Subsystem):
         help=lambda cls: softwrap(
             f"""
             Artifact requirements for this tool using specified as either the address of a `jvm_artifact`
-            target or, alternatively, as a colon-separated Maven coordinates (e.g., group:name:version).
+            target or, alternatively, as a colon-separated Maven coordinates (e.g., `group:name:version`).
             For Maven coordinates, the string `{{version}}` version will be substituted with the value of the
             `[{cls.options_scope}].version` option.
             """
@@ -93,6 +92,31 @@ class JvmToolBase(Subsystem):
         advanced=True,
     )
 
+    @classproperty
+    def default_lockfile_url(cls) -> str:
+        return git_url(
+            os.path.join(
+                "src",
+                "python",
+                cls.default_lockfile_resource[0].replace(".", os.path.sep),
+                cls.default_lockfile_resource[1],
+            )
+        )
+
+    @classmethod
+    def help_for_generate_lockfile_with_default_location(cls, resolve_name):
+        return softwrap(
+            f"""
+            You requested to generate a lockfile for {resolve_name} because
+            you included it in `--generate-lockfiles-resolve`, but
+            {resolve_name} is a tool using its default lockfile.
+
+            If you would like to generate a lockfile for {resolve_name}, please
+            set `[{resolve_name}].lockfile` to the path where it should be
+                    generated and run again.
+            """
+        )
+
     @property
     def artifact_inputs(self) -> tuple[str, ...]:
         return tuple(s.format(version=self.version) for s in self.artifacts)
@@ -111,7 +135,7 @@ async def gather_coordinates_for_jvm_lockfile(
         # group name is a file on disk.
         if 2 <= artifact_input.count(":"):
             try:
-                maybe_coord = Coordinate.from_coord_str(artifact_input).as_requirement()
+                maybe_coord = ArtifactRequirement(Coordinate.from_coord_str(artifact_input))
                 requirements.add(maybe_coord)
                 continue
             except Exception:
@@ -127,9 +151,13 @@ async def gather_coordinates_for_jvm_lockfile(
 
     if bad_artifact_inputs:
         raise ValueError(
-            "The following values could not be parsed as an address nor as a JVM coordinate string. "
-            f"The problematic inputs supplied to the `{request.option_name}` option were: "
-            f"{', '.join(bad_artifact_inputs)}."
+            softwrap(
+                f"""
+                The following values could not be parsed as an address nor as a JVM coordinate string.
+                The problematic inputs supplied to the `{request.option_name}` option were:
+                {', '.join(bad_artifact_inputs)}.
+                """
+            )
         )
 
     # Gather coordinates from the provided addresses.
@@ -190,22 +218,7 @@ class GenerateJvmLockfileFromTool:
         )
 
 
-@rule
-async def setup_lockfile_request_from_tool(
-    request: GenerateJvmLockfileFromTool,
-) -> GenerateJvmLockfile:
-    artifacts = await Get(
-        ArtifactRequirements,
-        GatherJvmCoordinatesRequest(request.artifact_inputs, request.artifact_option_name),
-    )
-    return GenerateJvmLockfile(
-        artifacts=artifacts,
-        resolve_name=request.resolve_name,
-        lockfile_dest=request.write_lockfile_dest
-        if request.read_lockfile_dest != DEFAULT_TOOL_LOCKFILE
-        else DEFAULT_TOOL_LOCKFILE,
-    )
-
-
 def rules():
+    from pants.jvm.goals import lockfile  # TODO: Shim to avoid import cycle
+
     return (*collect_rules(), *lockfile.rules())

@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import os.path
 from dataclasses import dataclass
 from pathlib import PurePath
 from textwrap import dedent
-from typing import Iterable, List, Set, Tuple, Type, cast
+from typing import Iterable, List, Set, Tuple, Type
 
 import pytest
 
+from pants.base.deprecated import warn_or_error
 from pants.base.specs import Specs
 from pants.base.specs_parser import SpecsParser
 from pants.engine.addresses import Address, Addresses, AddressInput, UnparsedAddressInputs
@@ -26,6 +28,7 @@ from pants.engine.internals.graph import (
     _DependencyMapping,
     _DependencyMappingRequest,
     _TargetParametrizations,
+    warn_deprecated_field_type,
 )
 from pants.engine.internals.native_engine import AddressParseException
 from pants.engine.internals.parametrize import Parametrize, _TargetParametrizationsRequest
@@ -33,12 +36,13 @@ from pants.engine.internals.scheduler import ExecutionError
 from pants.engine.rules import Get, MultiGet, rule
 from pants.engine.target import (
     AllTargets,
-    AllTargetsRequest,
     AllUnexpandedTargets,
+    AlwaysTraverseDeps,
     AsyncFieldMixin,
     CoarsenedTargets,
     Dependencies,
     DependenciesRequest,
+    DepsTraversalBehavior,
     ExplicitlyProvidedDependencies,
     Field,
     FieldDefaultFactoryRequest,
@@ -51,9 +55,10 @@ from pants.engine.target import (
     InferDependenciesRequest,
     InferredDependencies,
     InvalidFieldException,
+    InvalidTargetException,
     MultipleSourcesField,
     OverridesField,
-    SecondaryOwnerMixin,
+    ShouldTraverseDepsPredicate,
     SingleSourceField,
     SourcesPaths,
     SourcesPathsRequest,
@@ -63,12 +68,14 @@ from pants.engine.target import (
     Target,
     TargetFilesGenerator,
     Targets,
+    TransitivelyExcludeDependencies,
+    TransitivelyExcludeDependenciesRequest,
     TransitiveTargets,
     TransitiveTargetsRequest,
 )
 from pants.engine.unions import UnionMembership, UnionRule
-from pants.source.filespec import Filespec
 from pants.testutil.rule_runner import QueryRule, RuleRunner, engine_error
+from pants.util.docutil import bin_name
 from pants.util.ordered_set import FrozenOrderedSet
 
 
@@ -110,7 +117,13 @@ def resolve_field_default_factory(
 
 
 class MockMultipleSourcesField(MultipleSourcesField):
-    pass
+    deprecated_alias = "deprecated_sources"
+    deprecated_alias_removal_version = "9.9.9.dev0"
+
+
+class MockPluginField(StringField):
+    alias = "plugin_string"
+    required = False
 
 
 class MockTarget(Target):
@@ -137,15 +150,15 @@ class MockTargetGenerator(TargetFilesGenerator):
     core_fields = (MockMultipleSourcesField, OverridesField)
     generated_target_cls = MockGeneratedTarget
     copied_fields = ()
-    moved_fields = (Dependencies, Tags, ResolveField)
+    moved_fields = (MockDependencies, Tags, ResolveField)
 
 
 @pytest.fixture
 def transitive_targets_rule_runner() -> RuleRunner:
     return RuleRunner(
         rules=[
-            QueryRule(AllTargets, [AllTargetsRequest]),
-            QueryRule(AllUnexpandedTargets, [AllTargetsRequest]),
+            QueryRule(AllTargets, []),
+            QueryRule(AllUnexpandedTargets, []),
             QueryRule(CoarsenedTargets, [Addresses]),
             QueryRule(Targets, [DependenciesRequest]),
             QueryRule(TransitiveTargets, [TransitiveTargetsRequest]),
@@ -314,7 +327,12 @@ def test_special_cased_dependencies(transitive_targets_rule_runner: RuleRunner) 
     assert direct_deps == Targets()
 
     direct_deps = transitive_targets_rule_runner.request(
-        Targets, [DependenciesRequest(root[Dependencies], include_special_cased_deps=True)]
+        Targets,
+        [
+            DependenciesRequest(
+                root[Dependencies], should_traverse_deps_predicate=AlwaysTraverseDeps()
+            )
+        ],
     )
     assert direct_deps == Targets([d1, d2, d3])
 
@@ -327,7 +345,12 @@ def test_special_cased_dependencies(transitive_targets_rule_runner: RuleRunner) 
 
     transitive_targets = transitive_targets_rule_runner.request(
         TransitiveTargets,
-        [TransitiveTargetsRequest([root.address, d2.address], include_special_cased_deps=True)],
+        [
+            TransitiveTargetsRequest(
+                [root.address, d2.address],
+                should_traverse_deps_predicate=AlwaysTraverseDeps(),
+            )
+        ],
     )
     assert transitive_targets.roots == (root, d2)
     assert transitive_targets.dependencies == FrozenOrderedSet([d1, d2, d3, t2, t1])
@@ -365,6 +388,80 @@ def test_transitive_targets_tolerates_generated_target_cycles(
         Address("", relative_file_path="t1.txt", target_name="t1"),
         Address("", relative_file_path="dep.txt", target_name="dep"),
     ]
+
+
+def test_transitive_targets_with_should_traverse_deps_predicate(
+    transitive_targets_rule_runner: RuleRunner,
+) -> None:
+    transitive_targets_rule_runner.write_files(
+        {
+            "BUILD": dedent(
+                """\
+                target(name='t1')
+                target(name='t2', dependencies=[':t1'])
+                target(name='t3')
+                target(name='d1', dependencies=[':t1'])
+                target(name='d2', dependencies=[':t2'])
+                target(name='d3')
+                target(name='skipped', dependencies=[':t3'])
+                target(name='d4', tags=['skip_deps'], dependencies=[':skipped'])
+                target(name='root', dependencies=[':d1', ':d2', ':d3', ':d4'])
+                """
+            ),
+        }
+    )
+
+    def get_target(name: str) -> Target:
+        return transitive_targets_rule_runner.get_target(Address("", target_name=name))
+
+    t1 = get_target("t1")
+    t2 = get_target("t2")
+    t3 = get_target("t3")
+    d1 = get_target("d1")
+    d2 = get_target("d2")
+    d3 = get_target("d3")
+    skipped = get_target("skipped")
+    d4 = get_target("d4")
+    root = get_target("root")
+
+    direct_deps = transitive_targets_rule_runner.request(
+        Targets, [DependenciesRequest(root[Dependencies])]
+    )
+    assert direct_deps == Targets([d1, d2, d3, d4])
+
+    class SkipDepsTagOrTraverse(ShouldTraverseDepsPredicate):
+        def __call__(
+            self, target: Target, field: Dependencies | SpecialCasedDependencies
+        ) -> DepsTraversalBehavior:
+            if "skip_deps" in (target[Tags].value or []):
+                return DepsTraversalBehavior.EXCLUDE
+            return DepsTraversalBehavior.INCLUDE
+
+    predicate = SkipDepsTagOrTraverse()
+    # Assert the class is frozen even though it was not decorated with @dataclass(frozen=True)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        # The dataclass(frozen=True) decorator is only needed if the subclass adds fields.
+        predicate._callable = SkipDepsTagOrTraverse.__call__  # type: ignore[misc] # noqa
+
+    transitive_targets = transitive_targets_rule_runner.request(
+        TransitiveTargets,
+        [
+            TransitiveTargetsRequest(
+                [root.address, d2.address], should_traverse_deps_predicate=predicate
+            )
+        ],
+    )
+    assert transitive_targets.roots == (root, d2)
+    # NB: `//:d2` is both a target root and a dependency of `//:root`.
+    assert transitive_targets.dependencies == FrozenOrderedSet([d1, d2, d3, d4, t2, t1])
+    assert transitive_targets.closure == FrozenOrderedSet([root, d2, d1, d3, d4, t2, t1])
+    # `//:d4` depends on `//:skipped` which depends on `//:t3`.
+    # Nothing else depends on `//:skipped` or `//:t3`, so they should not
+    # be present in the list of transitive deps thanks to `should_traverse_deps_predicate`.
+    assert skipped not in transitive_targets.dependencies
+    assert t3 not in transitive_targets.dependencies
+    assert skipped not in transitive_targets.closure
+    assert t3 not in transitive_targets.closure
 
 
 def test_coarsened_targets(transitive_targets_rule_runner: RuleRunner) -> None:
@@ -609,6 +706,32 @@ def test_deprecated_field_name(transitive_targets_rule_runner: RuleRunner, caplo
     assert "Instead, use `dependencies`" in caplog.text
 
 
+def test_deprecated_field_name_on_generator_issue_20627(
+    transitive_targets_rule_runner: RuleRunner, caplog
+) -> None:
+    warn_deprecated_field_type.forget(MockDependencies)  # type: ignore[attr-defined]
+    warn_or_error.forget(  # type: ignore[attr-defined]
+        removal_version=MockDependencies.deprecated_alias_removal_version,
+        entity=f"the field name {MockDependencies.deprecated_alias}",
+        hint=(
+            f"Instead, use `{MockDependencies.alias}`, which behaves the same. Run `{bin_name()} "
+            "update-build-files` to automatically fix your BUILD files."
+        ),
+    )
+    transitive_targets_rule_runner.write_files(
+        {
+            "f1.txt": "",
+            "BUILD": "generator(name='t', deprecated_sources=['f1.txt'], deprecated_field=[])",
+        }
+    )
+    transitive_targets_rule_runner.get_target(
+        Address("", target_name="t", relative_file_path="f1.txt")
+    )
+    assert len(caplog.records) == 2
+    assert "Instead, use `sources`" in caplog.text
+    assert "Instead, use `dependencies`" in caplog.text
+
+
 def test_resolve_deprecated_target_name(transitive_targets_rule_runner: RuleRunner, caplog) -> None:
     transitive_targets_rule_runner.write_files({"BUILD": "deprecated_target(name='t')"})
     transitive_targets_rule_runner.get_target(Address("", target_name="t"))
@@ -669,7 +792,7 @@ def test_find_all_targets(transitive_targets_rule_runner: RuleRunner) -> None:
             "dir/BUILD": "target()",
         }
     )
-    all_tgts = transitive_targets_rule_runner.request(AllTargets, [AllTargetsRequest()])
+    all_tgts = transitive_targets_rule_runner.request(AllTargets, [])
     expected = {
         Address("", target_name="generator", relative_file_path="f1.txt"),
         Address("", target_name="generator", relative_file_path="f2.txt"),
@@ -678,24 +801,26 @@ def test_find_all_targets(transitive_targets_rule_runner: RuleRunner) -> None:
     }
     assert {t.address for t in all_tgts} == expected
 
-    all_unexpanded = transitive_targets_rule_runner.request(
-        AllUnexpandedTargets, [AllTargetsRequest()]
-    )
+    all_unexpanded = transitive_targets_rule_runner.request(AllUnexpandedTargets, [])
     assert {t.address for t in all_unexpanded} == {*expected, Address("", target_name="generator")}
 
 
-class MockSecondaryOwnerField(StringField, AsyncFieldMixin, SecondaryOwnerMixin):
-    alias = "secondary_owner_field"
-    required = True
+def test_invalid_target(transitive_targets_rule_runner: RuleRunner) -> None:
+    transitive_targets_rule_runner.write_files(
+        {
+            "path/to/BUILD": dedent(
+                """\
+                target(name='t1', frobnot='is-unknown')
+                """
+            ),
+        }
+    )
 
-    @property
-    def filespec(self) -> Filespec:
-        return {"includes": [os.path.join(self.address.spec_path, cast(str, self.value))]}
+    def get_target(name: str) -> Target:
+        return transitive_targets_rule_runner.get_target(Address("path/to", target_name=name))
 
-
-class MockSecondaryOwnerTarget(Target):
-    alias = "secondary_owner"
-    core_fields = (MockSecondaryOwnerField,)
+    with engine_error(InvalidTargetException, contains="path/to/BUILD:1: Unrecognized field"):
+        get_target("t1")
 
 
 @pytest.fixture
@@ -708,7 +833,6 @@ def owners_rule_runner() -> RuleRunner:
             MockTarget,
             MockTargetGenerator,
             MockGeneratedTarget,
-            MockSecondaryOwnerTarget,
         ],
         # NB: The `graph` module masks the environment is most/all positions. We disable the
         # inherent environment so that the positions which do require the environment are
@@ -749,7 +873,6 @@ def test_owners_source_file_does_not_exist(owners_rule_runner: RuleRunner) -> No
                 """\
                 target(name='not-generator', sources=['*.txt'])
                 generator(name='generator', sources=['*.txt'])
-                secondary_owner(name='secondary', secondary_owner_field='deleted.txt')
                 """
             ),
         }
@@ -760,7 +883,6 @@ def test_owners_source_file_does_not_exist(owners_rule_runner: RuleRunner) -> No
         expected={
             Address("demo", target_name="generator"),
             Address("demo", target_name="not-generator"),
-            Address("demo", target_name="secondary"),
         },
     )
 
@@ -783,7 +905,6 @@ def test_owners_source_file_does_not_exist(owners_rule_runner: RuleRunner) -> No
             Address("demo", target_name="generator", relative_file_path="f.txt"),
             Address("demo", target_name="generator"),
             Address("demo", target_name="not-generator"),
-            Address("demo", target_name="secondary"),
         },
     )
 
@@ -799,7 +920,6 @@ def test_owners_multiple_owners(owners_rule_runner: RuleRunner) -> None:
                 target(name='not-generator-f2', sources=['f2.txt'])
                 generator(name='generator-all', sources=['*.txt'])
                 generator(name='generator-f2', sources=['f2.txt'])
-                secondary_owner(name='secondary', secondary_owner_field='f1.txt')
                 """
             ),
         }
@@ -810,7 +930,6 @@ def test_owners_multiple_owners(owners_rule_runner: RuleRunner) -> None:
         expected={
             Address("demo", target_name="generator-all", relative_file_path="f1.txt"),
             Address("demo", target_name="not-generator-all"),
-            Address("demo", target_name="secondary"),
         },
     )
     assert_owners(
@@ -837,7 +956,6 @@ def test_owners_build_file(owners_rule_runner: RuleRunner) -> None:
                 target(name='f2_first', sources=['f2.txt'])
                 target(name='f2_second', sources=['f2.txt'])
                 generator(name='generated', sources=['*.txt'])
-                secondary_owner(name='secondary', secondary_owner_field='f1.txt')
                 """
             ),
         }
@@ -856,7 +974,6 @@ def test_owners_build_file(owners_rule_runner: RuleRunner) -> None:
             Address("demo", target_name="f1"),
             Address("demo", target_name="f2_first"),
             Address("demo", target_name="f2_second"),
-            Address("demo", target_name="secondary"),
             Address("demo", target_name="generated", relative_file_path="f1.txt"),
             Address("demo", target_name="generated", relative_file_path="f2.txt"),
         },
@@ -877,6 +994,8 @@ def generated_targets_rule_runner() -> RuleRunner:
             QueryRule(_TargetParametrizations, [_TargetParametrizationsRequest, EnvironmentName]),
             UnionRule(FieldDefaultFactoryRequest, ResolveFieldDefaultFactoryRequest),
             resolve_field_default_factory,
+            MockGeneratedTarget.register_plugin_field(MockPluginField),
+            MockTargetGenerator.register_plugin_field(MockPluginField, as_moved_field=True),
         ],
         target_types=[MockTargetGenerator, MockGeneratedTarget],
         objects={"parametrize": Parametrize},
@@ -919,7 +1038,7 @@ def assert_generated(
     if expected_dependencies is not None:
         # TODO: Adjust the `TransitiveTargets` API to expose the complete mapping.
         #   see https://github.com/pantsbuild/pants/issues/11270
-        specs = SpecsParser(rule_runner.build_root).parse_specs(
+        specs = SpecsParser(root_dir=rule_runner.build_root).parse_specs(
             ["::"], description_of_origin="tests"
         )
         addresses = rule_runner.request(Addresses, [specs])
@@ -948,11 +1067,34 @@ def test_generate_multiple(generated_targets_rule_runner: RuleRunner) -> None:
                 {SingleSourceField.alias: "f1.ext", Tags.alias: ["tag"]},
                 Address("demo", relative_file_path="f1.ext"),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f2.ext", Tags.alias: ["tag"]},
                 Address("demo", relative_file_path="f2.ext"),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
+            ),
+        },
+    )
+
+
+def test_generate_with_plugin_field(generated_targets_rule_runner: RuleRunner) -> None:
+    assert_generated(
+        generated_targets_rule_runner,
+        Address("demo"),
+        "generator(tags=['tag'], sources=['*.ext'], plugin_string='a')",
+        ["f1.ext"],
+        {
+            MockGeneratedTarget(
+                {
+                    SingleSourceField.alias: "f1.ext",
+                    Tags.alias: ["tag"],
+                    MockPluginField.alias: "a",
+                },
+                Address("demo", relative_file_path="f1.ext"),
+                residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
         },
     )
@@ -969,6 +1111,7 @@ def test_generate_subdir(generated_targets_rule_runner: RuleRunner) -> None:
                 {SingleSourceField.alias: "subdir/demo.f95"},
                 Address("src/fortran", target_name="demo", relative_file_path="subdir/demo.f95"),
                 residence_dir="src/fortran/subdir",
+                union_membership=generated_targets_rule_runner.union_membership,
             )
         },
     )
@@ -987,6 +1130,7 @@ def test_generate_overrides(generated_targets_rule_runner: RuleRunner) -> None:
                     Tags.alias: ["overridden"],
                 },
                 Address("example", relative_file_path="f1.ext"),
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
         },
     )
@@ -1016,11 +1160,13 @@ def test_parametrize(generated_targets_rule_runner: RuleRunner) -> None:
                 {SingleSourceField.alias: "f1.ext", Tags.alias: ["t1"]},
                 Address("demo", relative_file_path="f1.ext", parameters={"tags": "t1"}),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f1.ext", Tags.alias: ["t2"]},
                 Address("demo", relative_file_path="f1.ext", parameters={"tags": "t2"}),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
         },
         expected_dependencies={
@@ -1030,6 +1176,66 @@ def test_parametrize(generated_targets_rule_runner: RuleRunner) -> None:
             "demo/f1.ext@tags=t2": set(),
         },
     )
+
+
+def test_parametrize_moved_plugin_field(generated_targets_rule_runner: RuleRunner) -> None:
+    assert_generated(
+        generated_targets_rule_runner,
+        Address("demo"),
+        "generator(tags=['t1'], sources=['f1.ext'], plugin_string=parametrize(pa='a', pb='b'))",
+        ["f1.ext"],
+        {
+            MockGeneratedTarget(
+                {SingleSourceField.alias: "f1.ext", Tags.alias: ["t1"], MockPluginField.alias: "a"},
+                Address("demo", relative_file_path="f1.ext", parameters={"plugin_string": "pa"}),
+                residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
+            ),
+            MockGeneratedTarget(
+                {SingleSourceField.alias: "f1.ext", Tags.alias: ["t1"], MockPluginField.alias: "b"},
+                Address("demo", relative_file_path="f1.ext", parameters={"plugin_string": "pb"}),
+                residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
+            ),
+        },
+        expected_dependencies={
+            "demo@plugin_string=pa": {"demo/f1.ext@plugin_string=pa"},
+            "demo@plugin_string=pb": {"demo/f1.ext@plugin_string=pb"},
+            "demo/f1.ext@plugin_string=pa": set(),
+            "demo/f1.ext@plugin_string=pb": set(),
+        },
+    )
+
+
+def test_cannot_parametrize_copied_plugin_field() -> None:
+    rule_runner = RuleRunner(
+        rules=[
+            QueryRule(Addresses, [Specs]),
+            QueryRule(_DependencyMapping, [_DependencyMappingRequest]),
+            QueryRule(_TargetParametrizations, [_TargetParametrizationsRequest, EnvironmentName]),
+            UnionRule(FieldDefaultFactoryRequest, ResolveFieldDefaultFactoryRequest),
+            resolve_field_default_factory,
+            MockGeneratedTarget.register_plugin_field(MockPluginField),
+            MockTargetGenerator.register_plugin_field(MockPluginField),  # not moved
+        ],
+        target_types=[MockTargetGenerator, MockGeneratedTarget],
+        objects={"parametrize": Parametrize},
+        inherent_environment=None,
+    )
+
+    with pytest.raises(ExecutionError) as e:
+        assert_generated(
+            rule_runner,
+            Address("demo"),
+            "generator(tags=['t1'], sources=['f1.ext'], plugin_string=parametrize(pa='a', pb='b'))",
+            ["f1.ext"],
+        )
+
+    (field_exception,) = e.value.wrapped_exceptions
+    assert isinstance(field_exception, InvalidFieldException)
+    msg = str(field_exception)
+
+    assert "Only fields which will be moved to generated targets may be parametrized" in msg
 
 
 def test_parametrize_multi(generated_targets_rule_runner: RuleRunner) -> None:
@@ -1045,6 +1251,7 @@ def test_parametrize_multi(generated_targets_rule_runner: RuleRunner) -> None:
                     "demo", relative_file_path="f1.ext", parameters={"tags": "t1", "resolve": "a"}
                 ),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f1.ext", Tags.alias: ["t2"], ResolveField.alias: "a"},
@@ -1052,6 +1259,7 @@ def test_parametrize_multi(generated_targets_rule_runner: RuleRunner) -> None:
                     "demo", relative_file_path="f1.ext", parameters={"tags": "t2", "resolve": "a"}
                 ),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f1.ext", Tags.alias: ["t1"], ResolveField.alias: "b"},
@@ -1059,6 +1267,7 @@ def test_parametrize_multi(generated_targets_rule_runner: RuleRunner) -> None:
                     "demo", relative_file_path="f1.ext", parameters={"tags": "t1", "resolve": "b"}
                 ),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f1.ext", Tags.alias: ["t2"], ResolveField.alias: "b"},
@@ -1066,6 +1275,7 @@ def test_parametrize_multi(generated_targets_rule_runner: RuleRunner) -> None:
                     "demo", relative_file_path="f1.ext", parameters={"tags": "t2", "resolve": "b"}
                 ),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
         },
     )
@@ -1082,16 +1292,19 @@ def test_parametrize_overrides(generated_targets_rule_runner: RuleRunner) -> Non
                 {SingleSourceField.alias: "f1.ext", ResolveField.alias: "a"},
                 Address("demo", relative_file_path="f1.ext", parameters={"resolve": "a"}),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f1.ext", ResolveField.alias: "b"},
                 Address("demo", relative_file_path="f1.ext", parameters={"resolve": "b"}),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f2.ext", ResolveField.alias: "c"},
                 Address("demo", relative_file_path="f2.ext"),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
         },
         expected_dependencies={
@@ -1118,11 +1331,13 @@ def test_parametrize_atom(generated_targets_rule_runner: RuleRunner) -> None:
                 {SingleSourceField.alias: "f1.ext", ResolveField.alias: "a"},
                 Address("demo", target_name="demo", parameters={"resolve": "a"}),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
             MockGeneratedTarget(
                 {SingleSourceField.alias: "f1.ext", ResolveField.alias: "b"},
                 Address("demo", target_name="demo", parameters={"resolve": "b"}),
                 residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
             ),
         },
         expected_dependencies={
@@ -1321,6 +1536,9 @@ def test_parametrize_partial_exclude(generated_targets_rule_runner: RuleRunner) 
 
 
 def test_parametrize_16190(generated_targets_rule_runner: RuleRunner) -> None:
+    """Field subclassing defeats automatic filling of parameters for explicit dependencies on
+    parametrized targets."""
+
     class ParentField(Field):
         alias = "parent"
         help = "foo"
@@ -1373,13 +1591,119 @@ def test_parametrize_16190(generated_targets_rule_runner: RuleRunner) -> None:
     ],
 )
 def test_parametrize_16910(generated_targets_rule_runner: RuleRunner, field_content: str) -> None:
-    with engine_error(InvalidFieldException, contains=f"Unrecognized field `{field_content}`"):
+    """Misleading errror message for parametrized field that is unknown."""
+    with engine_error(
+        InvalidTargetException, contains=f"demo/BUILD:1: Unrecognized field `{field_content}`"
+    ):
         assert_generated(
             generated_targets_rule_runner,
             Address("demo"),
             f"generator({field_content}, sources=['*.ext'])",
             ["f1.ext", "f2.ext"],
         )
+
+
+def test_parametrize_single_value_16978(generated_targets_rule_runner: RuleRunner) -> None:
+    assert_generated(
+        generated_targets_rule_runner,
+        Address("demo"),
+        "generated(resolve=parametrize('demo'), source='f1.ext')",
+        ["f1.ext"],
+        {
+            MockGeneratedTarget(
+                {SingleSourceField.alias: "f1.ext", ResolveField.alias: "demo"},
+                Address("demo", parameters={"resolve": "demo"}),
+                residence_dir="demo",
+                union_membership=generated_targets_rule_runner.union_membership,
+            ),
+        },
+        expected_dependencies={
+            "demo@resolve=demo": set(),
+        },
+    )
+
+
+def test_parametrize_group_on_target_generator_20418(
+    generated_targets_rule_runner: RuleRunner,
+) -> None:
+    assert_generated(
+        generated_targets_rule_runner,
+        Address("demo", target_name="t"),
+        dedent(
+            """\
+            generator(
+              name='t',
+              sources=['f1.ext', 'f2.ext'],
+              **parametrize('a1', resolve='a', tags=['1']),
+              **parametrize('b2', resolve='b', tags=['2']),
+            )
+            """
+        ),
+        ["f1.ext", "f2.ext"],
+        expected_dependencies={
+            "demo/f1.ext:t@parametrize=a1": set(),
+            "demo/f1.ext:t@parametrize=b2": set(),
+            "demo/f2.ext:t@parametrize=a1": set(),
+            "demo/f2.ext:t@parametrize=b2": set(),
+            "demo:t@parametrize=a1": {
+                "demo/f1.ext:t@parametrize=a1",
+                "demo/f2.ext:t@parametrize=a1",
+            },
+            "demo:t@parametrize=b2": {
+                "demo/f1.ext:t@parametrize=b2",
+                "demo/f2.ext:t@parametrize=b2",
+            },
+        },
+    )
+
+
+def test_parametrize_explicit_dependencies_20739(
+    generated_targets_rule_runner: RuleRunner,
+) -> None:
+    assert_generated(
+        generated_targets_rule_runner,
+        Address("demo", target_name="tst"),
+        dedent(
+            """\
+            generator(
+              name='src',
+              sources=['src1.ext'],
+              **parametrize('b1', resolve='a'),
+              **parametrize('b2', resolve='b'),
+            )
+            generator(
+              name='tst',
+              sources=['tst1.ext'],
+              dependencies=['./src1.ext:src'],
+              **parametrize('b1', resolve='a'),
+              **parametrize('b2', resolve='b'),
+            )
+            """
+        ),
+        ["src1.ext", "tst1.ext"],
+        expected_dependencies={
+            "demo/src1.ext:src@parametrize=b1": set(),
+            "demo/src1.ext:src@parametrize=b2": set(),
+            "demo/tst1.ext:tst@parametrize=b1": {
+                "demo/src1.ext:src@parametrize=b1",
+            },
+            "demo/tst1.ext:tst@parametrize=b2": {
+                "demo/src1.ext:src@parametrize=b2",
+            },
+            "demo:src@parametrize=b1": {
+                "demo/src1.ext:src@parametrize=b1",
+            },
+            "demo:src@parametrize=b2": {
+                "demo/src1.ext:src@parametrize=b2",
+            },
+            "demo:tst@parametrize=b1": {
+                "demo/tst1.ext:tst@parametrize=b1",
+            },
+            "demo:tst@parametrize=b2": {
+                "demo/tst1.ext:tst@parametrize=b2",
+            },
+        },
+    )
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1825,6 +2149,10 @@ class InferSmalltalkDependencies(InferDependenciesRequest):
     infer_from = SmalltalkDependenciesInferenceFieldSet
 
 
+class TransitivelyExcludeSmalltalkDependencies(TransitivelyExcludeDependenciesRequest):
+    infer_from = SmalltalkDependenciesInferenceFieldSet
+
+
 @rule
 async def infer_smalltalk_dependencies(request: InferSmalltalkDependencies) -> InferredDependencies:
     # To demo an inference rule, we simply treat each `sources` file to contain a list of
@@ -1849,9 +2177,34 @@ async def infer_smalltalk_dependencies(request: InferSmalltalkDependencies) -> I
             AddressInput.parse(line[1:], description_of_origin="smalltalk rule"),
         )
         for line in all_lines
-        if line.startswith("!")
+        if line.startswith("!") and not line.startswith("!!")
     )
     return InferredDependencies(include, exclude=exclude)
+
+
+@rule
+async def transitive_exclude_smalltalk_dependencies(
+    request: TransitivelyExcludeSmalltalkDependencies,
+) -> TransitivelyExcludeDependencies:
+    # (Similar to `infer_smalltalk_dependencies`, but for `!!` addresses)
+    hydrated_sources = await Get(HydratedSources, HydrateSourcesRequest(request.field_set.source))
+    digest_contents = await Get(DigestContents, Digest, hydrated_sources.snapshot.digest)
+    all_lines = [
+        line.strip()
+        for line in itertools.chain.from_iterable(
+            file_content.content.decode().splitlines() for file_content in digest_contents
+        )
+    ]
+    transitive_excludes = await MultiGet(
+        Get(
+            Address,
+            AddressInput,
+            AddressInput.parse(line[2:], description_of_origin="smalltalk rule"),
+        )
+        for line in all_lines
+        if line.startswith("!!")
+    )
+    return TransitivelyExcludeDependencies(transitive_excludes)
 
 
 @pytest.fixture
@@ -1859,9 +2212,14 @@ def dependencies_rule_runner() -> RuleRunner:
     return RuleRunner(
         rules=[
             infer_smalltalk_dependencies,
+            transitive_exclude_smalltalk_dependencies,
             QueryRule(Addresses, [DependenciesRequest]),
             QueryRule(ExplicitlyProvidedDependencies, [DependenciesRequest]),
+            QueryRule(TransitiveTargets, [TransitiveTargetsRequest]),
             UnionRule(InferDependenciesRequest, InferSmalltalkDependencies),
+            UnionRule(
+                TransitivelyExcludeDependenciesRequest, TransitivelyExcludeSmalltalkDependencies
+            ),
         ],
         target_types=[SmalltalkLibrary, SmalltalkLibraryGenerator, MockTarget],
         # NB: The `graph` module masks the environment is most/all positions. We disable the
@@ -1956,6 +2314,23 @@ def test_normal_resolution(dependencies_rule_runner: RuleRunner) -> None:
     assert_dependencies_resolved(dependencies_rule_runner, Address("ignore"), expected=[])
 
 
+def test_target_error_message_for_bad_field_values(dependencies_rule_runner: RuleRunner) -> None:
+    dependencies_rule_runner.write_files(
+        {
+            "src/BUILD": "smalltalk_libraries(sources=['//'])",
+            "dep/BUILD": "target(dependencies=['//::typo#addr'])",
+        }
+    )
+    err = "src/BUILD:1: Invalid field value for 'sources' in target src:src: Absolute paths not supported: \"//\""
+    with engine_error(InvalidFieldException, contains=err):
+        dependencies_rule_runner.get_target(Address("src"))
+
+    err = "dep/BUILD:1: Failed to get dependencies for dep:dep: Failed to parse address spec"
+    with engine_error(InvalidFieldException, contains=err):
+        target = dependencies_rule_runner.get_target(Address("dep"))
+        dependencies_rule_runner.request(Addresses, [DependenciesRequest(target[Dependencies])])
+
+
 def test_explicit_file_dependencies(dependencies_rule_runner: RuleRunner) -> None:
     dependencies_rule_runner.write_files(
         {
@@ -2029,11 +2404,14 @@ def test_dependency_inference(dependencies_rule_runner: RuleRunner) -> None:
                 //:inferred_but_ignored2
                 """
             ),
+            # NB: The `!!//:inferred1` line shouldn't apply, since we aren't requesting transitive
+            # targets.
             "demo/f3.st": dedent(
                 """\
                 //:inferred1
                 !:inferred_and_provided1
                 !//:inferred_and_provided2
+                !!//:inferred1
                 """
             ),
             "demo/BUILD": dedent(
@@ -2182,3 +2560,31 @@ def test_resolve_unparsed_address_inputs() -> None:
     assert resolve(invalid_addresses, skip_invalid_addresses=True) == {t1}
     with engine_error(AddressParseException, contains="from my tests"):
         resolve(invalid_addresses)
+
+
+def test_plugin_transitive_excludes(dependencies_rule_runner: RuleRunner) -> None:
+    dependencies_rule_runner.write_files(
+        {
+            "transitive_dep.st": "",
+            "direct_dep.st": "//:transitive_dep.st",
+            "file.st": dedent(
+                """\
+                //:direct_dep.st
+                !!//:transitive_dep.st
+                """
+            ),
+            "BUILD": dedent(
+                """\
+                smalltalk_library(name="transitive_dep.st", source='transitive_dep.st')
+                smalltalk_library(name="direct_dep.st", source='direct_dep.st')
+                smalltalk_library(name="file.st", source='file.st')
+                """
+            ),
+        }
+    )
+    transitive_targets = dependencies_rule_runner.request(
+        TransitiveTargets, [TransitiveTargetsRequest([Address("", target_name="file.st")])]
+    )
+    assert {target.address for target in transitive_targets.dependencies} == {
+        Address("", target_name="direct_dep.st"),
+    }

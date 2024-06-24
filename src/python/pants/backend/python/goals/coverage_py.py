@@ -12,11 +12,6 @@ from typing import Any, MutableMapping, cast
 
 import toml
 
-from pants.backend.python.goals import lockfile
-from pants.backend.python.goals.lockfile import (
-    GeneratePythonLockfile,
-    GeneratePythonToolLockfileSentinel,
-)
 from pants.backend.python.subsystems.python_tool_base import PythonToolBase
 from pants.backend.python.target_types import ConsoleScript
 from pants.backend.python.util_rules.pex import PexRequest, VenvPex, VenvPexProcess
@@ -24,7 +19,7 @@ from pants.backend.python.util_rules.python_sources import (
     PythonSourceFiles,
     PythonSourceFilesRequest,
 )
-from pants.core.goals.generate_lockfiles import GenerateToolLockfileSentinel
+from pants.core.goals.resolves import ExportableTool
 from pants.core.goals.test import (
     ConsoleCoverageReport,
     CoverageData,
@@ -61,7 +56,6 @@ from pants.option.option_types import (
     StrOption,
 )
 from pants.source.source_root import AllSourceRoots
-from pants.util.docutil import git_url
 from pants.util.logging import LogLevel
 from pants.util.strutil import softwrap
 
@@ -113,24 +107,20 @@ class CoverageReportType(Enum):
 
 class CoverageSubsystem(PythonToolBase):
     options_scope = "coverage-py"
-    help = "Configuration for Python test coverage measurement."
+    help_short = "Configuration for Python test coverage measurement."
 
-    default_version = "coverage[toml]>=6.5,<6.6"
     default_main = ConsoleScript("coverage")
+    default_requirements = ["coverage[toml]>=6.5,<8"]
 
     register_interpreter_constraints = True
-    default_interpreter_constraints = ["CPython>=3.7,<4"]
 
-    register_lockfile = True
     default_lockfile_resource = ("pants.backend.python.subsystems", "coverage_py.lock")
-    default_lockfile_path = "src/python/pants/backend/python/subsystems/coverage_py.lock"
-    default_lockfile_url = git_url(default_lockfile_path)
 
     filter = StrListOption(
         help=softwrap(
             """
             A list of Python modules or filesystem paths to use in the coverage report, e.g.
-            `['helloworld_test', 'helloworld/util/dirutil'].
+            `['helloworld_test', 'helloworld/util/dirutil']`.
 
             Both modules and directory paths are recursive: any submodules or child paths,
             respectively, will be included.
@@ -158,7 +148,7 @@ class CoverageSubsystem(PythonToolBase):
         help=lambda cls: softwrap(
             f"""
             Path to an INI or TOML config file understood by coverage.py
-            (https://coverage.readthedocs.io/en/stable/config.html).
+            (https://coverage.readthedocs.io/en/latest/config.html).
 
             Setting this option will disable `[{cls.options_scope}].config_discovery`. Use
             this option if the config is located in a non-standard location.
@@ -196,7 +186,7 @@ class CoverageSubsystem(PythonToolBase):
             Fail if the total combined coverage percentage for all tests is less than this
             number.
 
-            Use this instead of setting fail_under in a coverage.py config file,
+            Use this instead of setting `fail_under` in a coverage.py config file,
             as the config will apply to each test separately, while you typically want this
             to apply to the combined coverage for all tests run.
 
@@ -204,7 +194,7 @@ class CoverageSubsystem(PythonToolBase):
             check to trigger.
 
             Note also that if you specify a non-integral value, you must
-            also set [report] precision properly in the coverage.py config file to make use
+            also set `[report] precision` properly in the coverage.py config file to make use
             of the decimal places. See https://coverage.readthedocs.io/en/latest/config.html.
             """
         ),
@@ -227,17 +217,6 @@ class CoverageSubsystem(PythonToolBase):
                 "pyproject.toml": b"[tool.coverage",
             },
         )
-
-
-class CoveragePyLockfileSentinel(GeneratePythonToolLockfileSentinel):
-    resolve_name = CoverageSubsystem.options_scope
-
-
-@rule
-def setup_coverage_lockfile(
-    _: CoveragePyLockfileSentinel, coverage: CoverageSubsystem
-) -> GeneratePythonLockfile:
-    return GeneratePythonLockfile.from_tool(coverage)
 
 
 @dataclass(frozen=True)
@@ -335,6 +314,23 @@ def get_branch_value_from_config(fc: FileContent) -> bool:
     return cp.getboolean(run_section, "branch", fallback=False)
 
 
+def get_namespace_value_from_config(fc: FileContent) -> bool:
+    if PurePath(fc.path).suffix == ".toml":
+        all_config = _parse_toml_config(fc)
+        return bool(
+            all_config.get("tool", {})
+            .get("coverage", {})
+            .get("report", {})
+            .get("include_namespace_packages", False)
+        )
+
+    cp = _parse_ini_config(fc)
+    report_section = "coverage:report" if fc.path in ("tox.ini", "setup.cfg") else "report"
+    if not cp.has_section(report_section):
+        return False
+    return cp.getboolean(report_section, "include_namespace_packages", fallback=False)
+
+
 @rule
 async def create_or_update_coverage_config(coverage: CoverageSubsystem) -> CoverageConfig:
     config_files = await Get(ConfigFiles, ConfigFilesRequest, coverage.config_request)
@@ -403,6 +399,9 @@ async def merge_coverage_data(
         # See https://github.com/pantsbuild/pants/issues/14542 .
         config_contents = await Get(DigestContents, Digest, coverage_config.digest)
         branch = get_branch_value_from_config(config_contents[0]) if config_contents else False
+        namespace_packages = (
+            get_namespace_value_from_config(config_contents[0]) if config_contents else False
+        )
         global_coverage_base_dir = PurePath("__global_coverage__")
         global_coverage_config_path = global_coverage_base_dir / "pyproject.toml"
         global_coverage_config_content = toml.dumps(
@@ -413,7 +412,10 @@ async def merge_coverage_data(
                             "relative_files": True,
                             "source": [source_root.path for source_root in source_roots],
                             "branch": branch,
-                        }
+                        },
+                        "report": {
+                            "include_namespace_packages": namespace_packages,
+                        },
                     }
                 }
             }
@@ -480,7 +482,7 @@ async def merge_coverage_data(
     )
     return MergedCoverageData(
         await Get(Digest, MergeDigests((result.output_digest, extra_sources_digest))),
-        tuple(addresses),
+        tuple(sorted(addresses)),
     )
 
 
@@ -499,12 +501,11 @@ async def generate_coverage_reports(
     )
     sources = await Get(
         PythonSourceFiles,
-        # Coverage sometimes includes non-Python files in its `.coverage` data. We need to
-        # ensure that they're present when generating the report. We include all the files included
-        # by `pytest_runner.py`.
-        PythonSourceFilesRequest(
-            transitive_targets.closure, include_files=True, include_resources=True
-        ),
+        # Coverage sometimes includes non-Python files in its `.coverage` data, so we
+        # include resources here. We don't include files because relocated_files targets
+        # may cause digest merge collisions. So anything you compute coverage over must
+        # be a source file or a resource.
+        PythonSourceFilesRequest(transitive_targets.closure, include_resources=True),
     )
     input_digest = await Get(
         Digest,
@@ -620,7 +621,6 @@ def _get_coverage_report(
 def rules():
     return [
         *collect_rules(),
-        *lockfile.rules(),
         UnionRule(CoverageDataCollection, PytestCoverageDataCollection),
-        UnionRule(GenerateToolLockfileSentinel, CoveragePyLockfileSentinel),
+        UnionRule(ExportableTool, CoverageSubsystem),
     ]

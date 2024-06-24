@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from abc import ABCMeta, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -33,6 +33,7 @@ from pants.core.goals.test import (
     TestResult,
     TestSubsystem,
     TestTimeoutField,
+    _format_test_rerun_command,
     _format_test_summary,
     build_runtime_package_dependencies,
     run_tests,
@@ -52,14 +53,22 @@ from pants.engine.fs import (
     EMPTY_DIGEST,
     EMPTY_FILE_DIGEST,
     Digest,
+    FileDigest,
     MergeDigests,
     Snapshot,
     Workspace,
 )
 from pants.engine.internals.session import RunId
-from pants.engine.process import InteractiveProcess, InteractiveProcessResult, ProcessResultMetadata
+from pants.engine.platform import Platform
+from pants.engine.process import (
+    InteractiveProcess,
+    InteractiveProcessResult,
+    ProcessExecutionEnvironment,
+    ProcessResultMetadata,
+)
 from pants.engine.target import (
     BoolField,
+    Field,
     MultipleSourcesField,
     Target,
     TargetRootsToFieldSets,
@@ -69,15 +78,65 @@ from pants.engine.unions import UnionMembership
 from pants.option.option_types import SkipOption
 from pants.option.subsystem import Subsystem
 from pants.testutil.option_util import create_goal_subsystem, create_subsystem
+from pants.testutil.python_rule_runner import PythonRuleRunner
 from pants.testutil.rule_runner import (
     MockEffect,
     MockGet,
     QueryRule,
-    RuleRunner,
     mock_console,
     run_rule_with_mocks,
 )
 from pants.util.logging import LogLevel
+
+
+def make_process_result_metadata(
+    source: str,
+    *,
+    environment_name: str | None = None,
+    docker_image: str | None = None,
+    remote_execution: bool = False,
+    total_elapsed_ms: int = 999,
+    source_run_id: int = 0,
+) -> ProcessResultMetadata:
+    return ProcessResultMetadata(
+        total_elapsed_ms,
+        ProcessExecutionEnvironment(
+            environment_name=environment_name,
+            # TODO: None of the following are currently consumed in these tests.
+            platform=Platform.create_for_localhost().value,
+            docker_image=docker_image,
+            remote_execution=remote_execution,
+            remote_execution_extra_platform_properties=[],
+            execute_in_workspace=False,
+        ),
+        source,
+        source_run_id,
+    )
+
+
+def make_test_result(
+    addresses: Iterable[Address],
+    exit_code: None | int,
+    stdout_bytes: bytes = b"",
+    stdout_digest: FileDigest = EMPTY_FILE_DIGEST,
+    stderr_bytes: bytes = b"",
+    stderr_digest: FileDigest = EMPTY_FILE_DIGEST,
+    coverage_data: CoverageData | None = None,
+    output_setting: ShowOutput = ShowOutput.NONE,
+    result_metadata: None | ProcessResultMetadata = None,
+) -> TestResult:
+    """Create a TestResult with default values for most fields."""
+    return TestResult(
+        addresses=tuple(addresses),
+        exit_code=exit_code,
+        stdout_bytes=stdout_bytes,
+        stdout_digest=stdout_digest,
+        stderr_bytes=stderr_bytes,
+        stderr_digest=stderr_digest,
+        coverage_data=coverage_data,
+        output_setting=output_setting,
+        result_metadata=result_metadata,
+    )
 
 
 class MockMultipleSourcesField(MultipleSourcesField):
@@ -93,9 +152,14 @@ class MockSkipTestsField(BoolField):
     default = False
 
 
+class MockRequiredField(Field):
+    alias = "required"
+    required = True
+
+
 class MockTarget(Target):
     alias = "mock_target"
-    core_fields = (MockMultipleSourcesField, MockSkipTestsField)
+    core_fields = (MockMultipleSourcesField, MockSkipTestsField, MockRequiredField)
 
 
 @dataclass(frozen=True)
@@ -107,8 +171,11 @@ class MockCoverageDataCollection(CoverageDataCollection):
     element_type = MockCoverageData
 
 
-class MockTestFieldSet(TestFieldSet, metaclass=ABCMeta):
-    required_fields = (MultipleSourcesField,)
+@dataclass(frozen=True)
+class MockTestFieldSet(TestFieldSet):
+    required_fields = (MultipleSourcesField, MockRequiredField)
+    sources: MultipleSourcesField
+    required: MockRequiredField
 
     @classmethod
     def opt_out(cls, tgt: Target) -> bool:
@@ -139,18 +206,12 @@ class MockTestRequest(TestRequest):
     @classmethod
     def test_result(cls, field_sets: Iterable[MockTestFieldSet]) -> TestResult:
         addresses = [field_set.address for field_set in field_sets]
-        return TestResult(
+        return make_test_result(
+            addresses,
             exit_code=cls.exit_code(addresses),
-            stdout="",
-            stdout_digest=EMPTY_FILE_DIGEST,
-            stderr="",
-            stderr_digest=EMPTY_FILE_DIGEST,
-            addresses=tuple(addresses),
             coverage_data=MockCoverageData(addresses),
             output_setting=ShowOutput.ALL,
-            result_metadata=None
-            if cls.skipped(addresses)
-            else ProcessResultMetadata(999, "ran_locally", 0),
+            result_metadata=None if cls.skipped(addresses) else make_process_result_metadata("ran"),
         )
 
 
@@ -189,18 +250,18 @@ def mock_test_partition(request: MockTestRequest.Batch, _: EnvironmentName) -> T
 
 
 @pytest.fixture
-def rule_runner() -> RuleRunner:
-    return RuleRunner()
+def rule_runner() -> PythonRuleRunner:
+    return PythonRuleRunner()
 
 
 def make_target(address: Address | None = None, *, skip: bool = False) -> Target:
     if address is None:
         address = Address("", target_name="tests")
-    return MockTarget({MockSkipTestsField.alias: skip}, address)
+    return MockTarget({MockSkipTestsField.alias: skip, MockRequiredField.alias: "present"}, address)
 
 
 def run_test_rule(
-    rule_runner: RuleRunner,
+    rule_runner: PythonRuleRunner,
     *,
     request_type: type[TestRequest],
     targets: list[Target],
@@ -210,6 +271,7 @@ def run_test_rule(
     report_dir: str = TestSubsystem.default_report_path,
     output: ShowOutput = ShowOutput.ALL,
     valid_targets: bool = True,
+    show_rerun_command: bool = False,
     run_id: RunId = RunId(999),
 ) -> tuple[int, str]:
     test_subsystem = create_goal_subsystem(
@@ -224,6 +286,7 @@ def run_test_rule(
         extra_env_vars=[],
         shard="",
         batch_size=1,
+        show_rerun_command=show_rerun_command,
     )
     debug_adapter_subsystem = create_subsystem(
         DebugAdapterSubsystem,
@@ -350,7 +413,7 @@ def run_test_rule(
         return result.exit_code, stdio_reader.get_stderr()
 
 
-def test_invalid_target_noops(rule_runner: RuleRunner) -> None:
+def test_invalid_target_noops(rule_runner: PythonRuleRunner) -> None:
     exit_code, stderr = run_test_rule(
         rule_runner,
         request_type=SuccessfulRequest,
@@ -361,7 +424,7 @@ def test_invalid_target_noops(rule_runner: RuleRunner) -> None:
     assert stderr.strip() == ""
 
 
-def test_skipped_target_noops(rule_runner: RuleRunner) -> None:
+def test_skipped_target_noops(rule_runner: PythonRuleRunner) -> None:
     exit_code, stderr = run_test_rule(
         rule_runner,
         request_type=ConditionallySucceedsRequest,
@@ -371,7 +434,39 @@ def test_skipped_target_noops(rule_runner: RuleRunner) -> None:
     assert stderr.strip() == ""
 
 
-def test_summary(rule_runner: RuleRunner) -> None:
+@pytest.mark.parametrize(
+    ("show_rerun_command", "expected_stderr"),
+    [
+        (
+            False,
+            # the summary is for humans, so we test it literally, to make sure the formatting is good
+            dedent(
+                """\
+
+                ✓ //:good succeeded in 1.00s (memoized).
+                ✕ //:bad failed in 1.00s (memoized).
+                """
+            ),
+        ),
+        (
+            True,
+            dedent(
+                """\
+
+                ✓ //:good succeeded in 1.00s (memoized).
+                ✕ //:bad failed in 1.00s (memoized).
+
+                To rerun the failing tests, use:
+
+                    pants test //:bad
+                """
+            ),
+        ),
+    ],
+)
+def test_summary(
+    rule_runner: PythonRuleRunner, show_rerun_command: bool, expected_stderr: str
+) -> None:
     good_address = Address("", target_name="good")
     bad_address = Address("", target_name="bad")
     skipped_address = Address("", target_name="skipped")
@@ -380,15 +475,10 @@ def test_summary(rule_runner: RuleRunner) -> None:
         rule_runner,
         request_type=ConditionallySucceedsRequest,
         targets=[make_target(good_address), make_target(bad_address), make_target(skipped_address)],
+        show_rerun_command=show_rerun_command,
     )
     assert exit_code == ConditionallySucceedsRequest.exit_code((bad_address,))
-    assert stderr == dedent(
-        """\
-
-        ✓ //:good succeeded in 1.00s (memoized).
-        ✕ //:bad failed in 1.00s (memoized).
-        """
-    )
+    assert stderr == expected_stderr
 
 
 def _assert_test_summary(
@@ -399,49 +489,118 @@ def _assert_test_summary(
     result_metadata: ProcessResultMetadata | None,
 ) -> None:
     assert expected == _format_test_summary(
-        TestResult(
+        make_test_result(
+            [Address(spec_path="", target_name="dummy_address")],
             exit_code=exit_code,
-            stdout="",
-            stderr="",
-            stdout_digest=EMPTY_FILE_DIGEST,
-            stderr_digest=EMPTY_FILE_DIGEST,
-            addresses=(Address(spec_path="", target_name="dummy_address"),),
-            output_setting=ShowOutput.FAILED,
             result_metadata=result_metadata,
+            output_setting=ShowOutput.FAILED,
         ),
         RunId(run_id),
         Console(use_colors=False),
     )
 
 
-def test_format_summary_remote(rule_runner: RuleRunner) -> None:
+def test_format_summary_remote(rule_runner: PythonRuleRunner) -> None:
     _assert_test_summary(
-        "✓ //:dummy_address succeeded in 0.05s (ran remotely).",
+        "✓ //:dummy_address succeeded in 0.05s (ran in remote environment `ubuntu`).",
         exit_code=0,
         run_id=0,
-        result_metadata=ProcessResultMetadata(50, "ran_remotely", 0),
+        result_metadata=make_process_result_metadata(
+            "ran", environment_name="ubuntu", remote_execution=True, total_elapsed_ms=50
+        ),
     )
 
 
-def test_format_summary_local(rule_runner: RuleRunner) -> None:
+def test_format_summary_local(rule_runner: PythonRuleRunner) -> None:
     _assert_test_summary(
         "✓ //:dummy_address succeeded in 0.05s.",
         exit_code=0,
         run_id=0,
-        result_metadata=ProcessResultMetadata(50, "ran_locally", 0),
+        result_metadata=make_process_result_metadata(
+            "ran", environment_name=None, total_elapsed_ms=50
+        ),
     )
 
 
-def test_format_summary_memoized(rule_runner: RuleRunner) -> None:
+def test_format_summary_memoized(rule_runner: PythonRuleRunner) -> None:
     _assert_test_summary(
         "✓ //:dummy_address succeeded in 0.05s (memoized).",
         exit_code=0,
         run_id=1234,
-        result_metadata=ProcessResultMetadata(50, "ran_locally", 0),
+        result_metadata=make_process_result_metadata("ran", total_elapsed_ms=50),
     )
 
 
-def test_debug_target(rule_runner: RuleRunner) -> None:
+def test_format_summary_memoized_remote(rule_runner: PythonRuleRunner) -> None:
+    _assert_test_summary(
+        "✓ //:dummy_address succeeded in 0.05s (memoized for remote environment `ubuntu`).",
+        exit_code=0,
+        run_id=1234,
+        result_metadata=make_process_result_metadata(
+            "ran", environment_name="ubuntu", remote_execution=True, total_elapsed_ms=50
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        pytest.param([], None, id="no_results"),
+        pytest.param(
+            [make_test_result([Address("", target_name="t1")], exit_code=0)], None, id="one_success"
+        ),
+        pytest.param(
+            [make_test_result([Address("", target_name="t2")], exit_code=None)],
+            None,
+            id="one_no_run",
+        ),
+        pytest.param(
+            [make_test_result([Address("", target_name="t3")], exit_code=1)],
+            "To rerun the failing tests, use:\n\n    pants test //:t3",
+            id="one_failure",
+        ),
+        pytest.param(
+            [
+                make_test_result([Address("", target_name="t1")], exit_code=0),
+                make_test_result([Address("", target_name="t2")], exit_code=None),
+                make_test_result([Address("", target_name="t3")], exit_code=1),
+            ],
+            "To rerun the failing tests, use:\n\n    pants test //:t3",
+            id="one_of_each",
+        ),
+        pytest.param(
+            [
+                make_test_result([Address("path/to", target_name="t1")], exit_code=1),
+                make_test_result([Address("another/path", target_name="t2")], exit_code=2),
+                make_test_result([Address("", target_name="t3")], exit_code=3),
+            ],
+            "To rerun the failing tests, use:\n\n    pants test //:t3 another/path:t2 path/to:t1",
+            id="multiple_failures",
+        ),
+        pytest.param(
+            [
+                make_test_result(
+                    [
+                        Address(
+                            "path with spaces",
+                            target_name="$*",
+                            parameters=dict(key="value"),
+                            generated_name="gn",
+                        )
+                    ],
+                    exit_code=1,
+                )
+            ],
+            "To rerun the failing tests, use:\n\n    pants test 'path with spaces:$*#gn@key=value'",
+            id="special_characters_require_quoting",
+        ),
+    ],
+)
+def test_format_rerun_command(results: list[TestResult], expected: None | str) -> None:
+    assert expected == _format_test_rerun_command(results)
+
+
+def test_debug_target(rule_runner: PythonRuleRunner) -> None:
     exit_code, _ = run_test_rule(
         rule_runner,
         request_type=SuccessfulRequest,
@@ -451,7 +610,7 @@ def test_debug_target(rule_runner: RuleRunner) -> None:
     assert exit_code == 0
 
 
-def test_report(rule_runner: RuleRunner) -> None:
+def test_report(rule_runner: PythonRuleRunner) -> None:
     addr1 = Address("", target_name="t1")
     addr2 = Address("", target_name="t2")
     exit_code, stderr = run_test_rule(
@@ -464,7 +623,7 @@ def test_report(rule_runner: RuleRunner) -> None:
     assert "Wrote test reports to dist/test/reports" in stderr
 
 
-def test_report_dir(rule_runner: RuleRunner) -> None:
+def test_report_dir(rule_runner: PythonRuleRunner) -> None:
     report_dir = "dist/test-results"
     addr1 = Address("", target_name="t1")
     addr2 = Address("", target_name="t2")
@@ -479,7 +638,7 @@ def test_report_dir(rule_runner: RuleRunner) -> None:
     assert f"Wrote test reports to {report_dir}" in stderr
 
 
-def test_coverage(rule_runner: RuleRunner) -> None:
+def test_coverage(rule_runner: PythonRuleRunner) -> None:
     addr1 = Address("", target_name="t1")
     addr2 = Address("", target_name="t2")
     exit_code, stderr = run_test_rule(
@@ -543,16 +702,14 @@ def assert_streaming_output(
     output_setting: ShowOutput = ShowOutput.ALL,
     expected_level: LogLevel,
     expected_message: str,
-    result_metadata: ProcessResultMetadata = ProcessResultMetadata(999, "dummy", 0),
+    result_metadata: ProcessResultMetadata = make_process_result_metadata("dummy"),
 ) -> None:
-    result = TestResult(
-        exit_code=exit_code,
-        stdout=stdout,
-        stdout_digest=EMPTY_FILE_DIGEST,
-        stderr=stderr,
-        stderr_digest=EMPTY_FILE_DIGEST,
-        output_setting=output_setting,
+    result = make_test_result(
         addresses=(Address("demo_test"),),
+        exit_code=exit_code,
+        stdout_bytes=stdout.encode(),
+        stderr_bytes=stderr.encode(),
+        output_setting=output_setting,
         result_metadata=result_metadata,
     )
     assert result.level() == expected_level
@@ -607,7 +764,7 @@ def test_streaming_output_failure() -> None:
 
 
 def test_runtime_package_dependencies() -> None:
-    rule_runner = RuleRunner(
+    rule_runner = PythonRuleRunner(
         rules=[
             build_runtime_package_dependencies,
             *pex_from_targets.rules(),
@@ -665,3 +822,14 @@ def test_timeout_calculation() -> None:
     assert_timeout_calculated(field_value=None, expected=None)
     assert_timeout_calculated(field_value=None, global_default=20, global_max=10, expected=10)
     assert_timeout_calculated(field_value=10, timeouts_enabled=False, expected=None)
+
+
+def test_non_utf8_output() -> None:
+    test_result = make_test_result(
+        [],
+        exit_code=1,  # "test error" so stdout/stderr are output in message
+        stdout_bytes=b"\x80\xBF",  # invalid UTF-8 as required by the test
+        stderr_bytes=b"\x80\xBF",  # invalid UTF-8 as required by the test
+        output_setting=ShowOutput.ALL,
+    )
+    assert test_result.message() == "failed (exit code 1).\n��\n��\n\n"

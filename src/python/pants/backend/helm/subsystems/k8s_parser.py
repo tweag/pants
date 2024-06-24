@@ -10,20 +10,15 @@ from pathlib import PurePath
 from typing import Any
 
 from pants.backend.helm.utils.yaml import YamlPath
-from pants.backend.python.goals import lockfile
-from pants.backend.python.goals.lockfile import GeneratePythonLockfile
 from pants.backend.python.subsystems.python_tool_base import PythonToolRequirementsBase
 from pants.backend.python.target_types import EntryPoint
 from pants.backend.python.util_rules import pex
-from pants.backend.python.util_rules.pex import PexRequest, VenvPex, VenvPexProcess
-from pants.backend.python.util_rules.pex_requirements import GeneratePythonToolLockfileSentinel
-from pants.core.goals.generate_lockfiles import GenerateToolLockfileSentinel
+from pants.backend.python.util_rules.pex import VenvPex, VenvPexProcess, VenvPexRequest
+from pants.backend.python.util_rules.pex_environment import PexEnvironment
 from pants.engine.engine_aware import EngineAwareParameter, EngineAwareReturnType
 from pants.engine.fs import CreateDigest, Digest, FileContent, FileEntry
 from pants.engine.process import FallibleProcessResult
 from pants.engine.rules import Get, collect_rules, rule
-from pants.engine.unions import UnionRule
-from pants.util.docutil import git_url
 from pants.util.logging import LogLevel
 from pants.util.strutil import pluralize, softwrap
 
@@ -35,30 +30,21 @@ _HELM_K8S_PARSER_PACKAGE = "pants.backend.helm.subsystems"
 
 class HelmKubeParserSubsystem(PythonToolRequirementsBase):
     options_scope = "helm-k8s-parser"
-    help = "Analyses K8S manifests rendered by Helm."
+    help_short = "Analyses K8S manifests rendered by Helm."
 
-    default_version = "hikaru==0.11.0b"
+    default_requirements = [
+        "hikaru>=1.1.0",
+        "hikaru-model-28",
+        "hikaru-model-27",
+        "hikaru-model-26",
+        "hikaru-model-25",
+        "hikaru-model-24",
+        "hikaru-model-23",
+    ]
 
     register_interpreter_constraints = True
-    default_interpreter_constraints = ["CPython>=3.7,<3.10"]
 
-    register_lockfile = True
     default_lockfile_resource = (_HELM_K8S_PARSER_PACKAGE, "k8s_parser.lock")
-    default_lockfile_path = (
-        f"src/python/{_HELM_K8S_PARSER_PACKAGE.replace('.', '/')}/k8s_parser.lock"
-    )
-    default_lockfile_url = git_url(default_lockfile_path)
-
-
-class HelmKubeParserLockfileSentinel(GeneratePythonToolLockfileSentinel):
-    resolve_name = HelmKubeParserSubsystem.options_scope
-
-
-@rule
-def setup_k8s_parser_lockfile_request(
-    _: HelmKubeParserLockfileSentinel, post_renderer: HelmKubeParserSubsystem
-) -> GeneratePythonLockfile:
-    return GeneratePythonLockfile.from_tool(post_renderer)
 
 
 @dataclass(frozen=True)
@@ -67,7 +53,10 @@ class _HelmKubeParserTool:
 
 
 @rule
-async def build_k8s_parser_tool(k8s_parser: HelmKubeParserSubsystem) -> _HelmKubeParserTool:
+async def build_k8s_parser_tool(
+    k8s_parser: HelmKubeParserSubsystem,
+    pex_environment: PexEnvironment,
+) -> _HelmKubeParserTool:
     parser_sources = pkgutil.get_data(_HELM_K8S_PARSER_PACKAGE, _HELM_K8S_PARSER_SOURCE)
     if not parser_sources:
         raise ValueError(
@@ -79,11 +68,21 @@ async def build_k8s_parser_tool(k8s_parser: HelmKubeParserSubsystem) -> _HelmKub
     )
     parser_digest = await Get(Digest, CreateDigest([parser_file_content]))
 
+    # We use copies of site packages because hikaru gets confused with symlinked packages
+    # The core hikaru package tries to load the packages containing the kubernetes-versioned models
+    # using the __path__ attribute of the core package,
+    # which doesn't work when the packages are symlinked from inside the namespace-handling dirs in the PEX
+    use_site_packages_copies = True
+
     parser_pex = await Get(
         VenvPex,
-        PexRequest,
-        k8s_parser.to_pex_request(
-            main=EntryPoint(PurePath(parser_file_content.path).stem), sources=parser_digest
+        VenvPexRequest(
+            k8s_parser.to_pex_request(
+                main=EntryPoint(PurePath(parser_file_content.path).stem),
+                sources=parser_digest,
+            ),
+            pex_environment.in_sandbox(working_directory=None),
+            site_packages_copies=use_site_packages_copies,
         ),
     )
     return _HelmKubeParserTool(parser_pex)
@@ -101,9 +100,16 @@ class ParseKubeManifestRequest(EngineAwareParameter):
 
 
 @dataclass(frozen=True)
+class ParsedImageRefEntry:
+    document_index: int
+    path: YamlPath
+    unparsed_image_ref: str
+
+
+@dataclass(frozen=True)
 class ParsedKubeManifest(EngineAwareReturnType):
     filename: str
-    found_image_refs: tuple[tuple[int, YamlPath, str], ...]
+    found_image_refs: tuple[ParsedImageRefEntry, ...]
 
     def level(self) -> LogLevel | None:
         return LogLevel.DEBUG
@@ -137,7 +143,7 @@ async def parse_kube_manifest(
 
     if result.exit_code == 0:
         output = result.stdout.decode("utf-8").splitlines()
-        image_refs: list[tuple[int, YamlPath, str]] = []
+        image_refs: list[ParsedImageRefEntry] = []
         for line in output:
             parts = line.split(",")
             if len(parts) != 3:
@@ -150,7 +156,13 @@ async def parse_kube_manifest(
                     )
                 )
 
-            image_refs.append((int(parts[0]), YamlPath.parse(parts[1]), parts[2]))
+            image_refs.append(
+                ParsedImageRefEntry(
+                    document_index=int(parts[0]),
+                    path=YamlPath.parse(parts[1]),
+                    unparsed_image_ref=parts[2],
+                )
+            )
 
         return ParsedKubeManifest(filename=request.file.path, found_image_refs=tuple(image_refs))
     else:
@@ -169,6 +181,4 @@ def rules():
     return [
         *collect_rules(),
         *pex.rules(),
-        *lockfile.rules(),
-        UnionRule(GenerateToolLockfileSentinel, HelmKubeParserLockfileSentinel),
     ]

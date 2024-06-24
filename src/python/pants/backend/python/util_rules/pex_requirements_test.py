@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import textwrap
 
 import pytest
 
-from pants.backend.python.pip_requirement import PipRequirement
 from pants.backend.python.subsystems.setup import InvalidLockfileBehavior, PythonSetup
 from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
 from pants.backend.python.util_rules.lockfile_metadata import PythonLockfileMetadataV3
@@ -17,9 +17,9 @@ from pants.backend.python.util_rules.pex_requirements import (
     ResolvePexConfig,
     ResolvePexConstraintsFile,
     _pex_lockfile_requirement_count,
-    _strip_comments_from_pex_json_lockfile,
     get_metadata,
     is_probably_pex_json_lockfile,
+    strip_comments_from_pex_json_lockfile,
     validate_metadata,
 )
 from pants.core.util_rules.lockfile_metadata import (
@@ -30,6 +30,8 @@ from pants.core.util_rules.lockfile_metadata import (
 from pants.engine.internals.native_engine import EMPTY_DIGEST
 from pants.testutil.option_util import create_subsystem
 from pants.util.ordered_set import FrozenOrderedSet
+from pants.util.pip_requirement import PipRequirement
+from pants.util.strutil import comma_separated_list
 
 METADATA = PythonLockfileMetadataV3(
     InterpreterConstraints(["==3.8.*"]),
@@ -49,6 +51,8 @@ def create_python_setup(
         invalid_lockfile_behavior=behavior,
         resolves_generate_lockfiles=enable_resolves,
         interpreter_versions_universe=PythonSetup.default_interpreter_universe,
+        resolves={"a": "lock.txt"},
+        default_resolve="a",
     )
 
 
@@ -152,8 +156,8 @@ def test_validate_lockfiles(
         ["bad-req"] if invalid_reqs else [str(r) for r in METADATA.requirements]
     )
     lockfile = Lockfile(
-        file_path="lock.txt",
-        file_path_description_of_origin="foo",
+        url="lock.txt",
+        url_description_of_origin="foo",
         resolve_name="a",
     )
 
@@ -162,8 +166,9 @@ def test_validate_lockfiles(
         runtime_interpreter_constraints,
         lockfile,
         req_strings,
-        create_python_setup(InvalidLockfileBehavior.warn),
-        ResolvePexConfig(
+        validate_consumed_req_strings=True,
+        python_setup=create_python_setup(InvalidLockfileBehavior.warn),
+        resolve_config=ResolvePexConfig(
             indexes=(),
             find_links=(),
             manylinux="not-manylinux" if invalid_manylinux else None,
@@ -183,13 +188,17 @@ def test_validate_lockfiles(
     def contains(msg: str, if_: bool = True) -> None:
         assert (msg in caplog.text) is if_
 
-    contains("You are using the `a` lockfile at lock.txt with incompatible inputs")
+    reqs_desc = comma_separated_list(f"`{rs}`" for rs in req_strings)
+    contains(
+        f"You are consuming {reqs_desc} from the `a` lockfile at lock.txt "
+        "with incompatible inputs"
+    )
     contains(
         "The lockfile does not provide all the necessary requirements",
         if_=invalid_reqs,
     )
     contains(
-        "The requirements not provided by the `a` resolve are: ['bad-req']",
+        "The requirements not provided by the `a` resolve are:\n  ['bad-req']",
         if_=invalid_reqs,
     )
 
@@ -249,7 +258,7 @@ def test_is_probably_pex_json_lockfile():
 
 def test_strip_comments_from_pex_json_lockfile() -> None:
     def assert_stripped(lock: str, expected: str) -> None:
-        assert _strip_comments_from_pex_json_lockfile(lock.encode()).decode() == expected
+        assert strip_comments_from_pex_json_lockfile(lock.encode()).decode() == expected
 
     assert_stripped("{}", "{}")
     assert_stripped(
@@ -339,3 +348,78 @@ def test_pex_lockfile_requirement_count() -> None:
         )
         == 3
     )
+
+
+class TestResolvePexConfigPexArgs:
+    def pairwise(self, iterable):
+        # Drop once on 3.10
+        # https://docs.python.org/3/library/itertools.html#itertools.pairwise
+        a, b = itertools.tee(iterable)
+        next(b, None)
+        return zip(a, b)
+
+    def simple_config_args(self, manylinux=None, only_binary=None, no_binary=None):
+        return tuple(
+            ResolvePexConfig(
+                indexes=[],
+                find_links=[],
+                manylinux=manylinux,
+                constraints_file=None,
+                no_binary=FrozenOrderedSet(no_binary) if no_binary else FrozenOrderedSet(),
+                only_binary=FrozenOrderedSet(only_binary) if only_binary else FrozenOrderedSet(),
+                path_mappings=[],
+            ).pex_args()
+        )
+
+    def test_minimal(self):
+        args = self.simple_config_args()
+        assert len(args) == 2
+
+    def test_manylinux(self):
+        assert "--no-manylinux" in self.simple_config_args()
+
+        many = "manylinux2014_ppc64le"
+        args = self.simple_config_args(manylinux=many)
+        assert len(args) == 3
+        assert ("--manylinux", many) in self.pairwise(args)
+
+    def test_only_binary(self):
+        assert "--only-binary=foo" in self.simple_config_args(only_binary=["foo"])
+        assert ("--only-binary=foo", "--only-binary=bar") in self.pairwise(
+            self.simple_config_args(only_binary=["foo", "bar"])
+        )
+
+    def test_only_binary_all(self):
+        args = self.simple_config_args(only_binary=[":all:"])
+        assert "--wheel" in args
+        assert "--no-build" in args
+        assert "--only-binary" not in " ".join(args)
+
+        args = self.simple_config_args(only_binary=["foo", ":all:"])
+        assert "--wheel" in args
+        assert "--no-build" in args
+        assert "--only-binary" not in " ".join(args)
+
+    def test_only_binary_none(self):
+        assert "--wheel" not in self.simple_config_args(only_binary=[":none:"])
+        assert "--only-binary" not in " ".join(self.simple_config_args(only_binary=[":none:"]))
+        assert "--build" in self.simple_config_args(only_binary=[":none:"])
+
+    def test_no_binary(self):
+        assert "--only-build=foo" in self.simple_config_args(no_binary=["foo"])
+        assert ("--only-build=foo", "--only-build=bar") in self.pairwise(
+            self.simple_config_args(no_binary=["foo", "bar"])
+        )
+
+    def test_no_binary_all(self):
+        args = self.simple_config_args(no_binary=[":all:"])
+        assert "--build" in args
+        assert "--no-wheel" in args
+        assert "--no-binary" not in args
+
+    def test_no_binary_none(self):
+        assert "--wheel" in self.simple_config_args(no_binary=[":none:"])
+        assert "--only-build" not in " ".join(self.simple_config_args(no_binary=[":none:"]))
+
+        assert "--wheel" in self.simple_config_args(no_binary=["foo", ":none:"])
+        assert "--only-build" not in " ".join(self.simple_config_args(no_binary=["foo", ":none:"]))

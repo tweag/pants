@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
+import shlex
 from abc import ABC, ABCMeta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import PurePath
-from typing import Any, ClassVar, Iterable, Optional, TypeVar, cast
+from typing import Any, ClassVar, Iterable, Optional, Sequence, Tuple, TypeVar, cast
 
 from pants.core.goals.multi_tool_goal_helper import SkippableSubsystem
-from pants.core.goals.package import BuiltPackage, PackageFieldSet
+from pants.core.goals.package import BuiltPackage, EnvironmentAwarePackageRequest, PackageFieldSet
 from pants.core.subsystems.debug_adapter import DebugAdapterSubsystem
 from pants.core.util_rules.distdir import DistDir
 from pants.core.util_rules.environments import (
@@ -42,7 +44,7 @@ from pants.engine.process import (
     InteractiveProcessResult,
     ProcessResultMetadata,
 )
-from pants.engine.rules import Effect, Get, MultiGet, collect_rules, goal_rule, rule, rule_helper
+from pants.engine.rules import Effect, Get, MultiGet, collect_rules, goal_rule, rule
 from pants.engine.target import (
     FieldSet,
     FieldSetsPerTarget,
@@ -51,6 +53,7 @@ from pants.engine.target import (
     NoApplicableTargetsBehavior,
     SourcesField,
     SpecialCasedDependencies,
+    StringField,
     StringSequenceField,
     TargetRootsToFieldSets,
     TargetRootsToFieldSetsRequest,
@@ -63,9 +66,9 @@ from pants.option.option_types import BoolOption, EnumOption, IntOption, StrList
 from pants.util.collections import partition_sequentially
 from pants.util.docutil import bin_name
 from pants.util.logging import LogLevel
-from pants.util.memo import memoized
+from pants.util.memo import memoized, memoized_property
 from pants.util.meta import classproperty
-from pants.util.strutil import softwrap
+from pants.util.strutil import Simplifier, help_text, softwrap
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +78,16 @@ class TestResult(EngineAwareReturnType):
     # A None exit_code indicates a backend that performs its own test discovery/selection
     # (rather than delegating that to the underlying test tool), and discovered no tests.
     exit_code: int | None
-    stdout: str
+    stdout_bytes: bytes
     stdout_digest: FileDigest
-    stderr: str
+    stderr_bytes: bytes
     stderr_digest: FileDigest
     addresses: tuple[Address, ...]
     output_setting: ShowOutput
     # A None result_metadata indicates a backend that performs its own test discovery/selection
-    # and either discovered no tests, or encounted an error, such as a compilation error, in
+    # and either discovered no tests, or encountered an error, such as a compilation error, in
     # the attempt.
-    result_metadata: ProcessResultMetadata | None
+    result_metadata: ProcessResultMetadata | None  # TODO: Merge elapsed MS of all subproceses
     partition_description: str | None = None
 
     coverage_data: CoverageData | None = None
@@ -95,6 +98,10 @@ class TestResult(EngineAwareReturnType):
     extra_output: Snapshot | None = None
     # True if the core test rules should log that extra output was written.
     log_extra_output: bool = False
+    # All results including failed attempts
+    process_results: Tuple[FallibleProcessResult, ...] = field(default_factory=tuple)
+
+    output_simplifier: Simplifier = Simplifier()
 
     # Prevent this class from being detected by pytest as a test class.
     __test__ = False
@@ -104,8 +111,8 @@ class TestResult(EngineAwareReturnType):
         """Used when we do test discovery ourselves, and we didn't find any."""
         return TestResult(
             exit_code=None,
-            stdout="",
-            stderr="",
+            stdout_bytes=b"",
+            stderr_bytes=b"",
             stdout_digest=EMPTY_FILE_DIGEST,
             stderr_digest=EMPTY_FILE_DIGEST,
             addresses=(address,),
@@ -120,8 +127,8 @@ class TestResult(EngineAwareReturnType):
         """Used when we do test discovery ourselves, and we didn't find any."""
         return TestResult(
             exit_code=None,
-            stdout="",
-            stderr="",
+            stdout_bytes=b"",
+            stderr_bytes=b"",
             stdout_digest=EMPTY_FILE_DIGEST,
             stderr_digest=EMPTY_FILE_DIGEST,
             addresses=tuple(field_set.address for field_set in batch.elements),
@@ -132,7 +139,7 @@ class TestResult(EngineAwareReturnType):
 
     @staticmethod
     def from_fallible_process_result(
-        process_result: FallibleProcessResult,
+        process_results: Tuple[FallibleProcessResult, ...],
         address: Address,
         output_setting: ShowOutput,
         *,
@@ -140,12 +147,14 @@ class TestResult(EngineAwareReturnType):
         xml_results: Snapshot | None = None,
         extra_output: Snapshot | None = None,
         log_extra_output: bool = False,
+        output_simplifier: Simplifier = Simplifier(),
     ) -> TestResult:
+        process_result = process_results[-1]
         return TestResult(
             exit_code=process_result.exit_code,
-            stdout=process_result.stdout.decode(),
+            stdout_bytes=process_result.stdout,
             stdout_digest=process_result.stdout_digest,
-            stderr=process_result.stderr.decode(),
+            stderr_bytes=process_result.stderr,
             stderr_digest=process_result.stderr_digest,
             addresses=(address,),
             output_setting=output_setting,
@@ -154,11 +163,13 @@ class TestResult(EngineAwareReturnType):
             xml_results=xml_results,
             extra_output=extra_output,
             log_extra_output=log_extra_output,
+            process_results=process_results,
+            output_simplifier=output_simplifier,
         )
 
     @staticmethod
     def from_batched_fallible_process_result(
-        process_result: FallibleProcessResult,
+        process_results: Tuple[FallibleProcessResult, ...],
         batch: TestRequest.Batch[_TestFieldSetT, Any],
         output_setting: ShowOutput,
         *,
@@ -166,12 +177,14 @@ class TestResult(EngineAwareReturnType):
         xml_results: Snapshot | None = None,
         extra_output: Snapshot | None = None,
         log_extra_output: bool = False,
+        output_simplifier: Simplifier = Simplifier(),
     ) -> TestResult:
+        process_result = process_results[-1]
         return TestResult(
             exit_code=process_result.exit_code,
-            stdout=process_result.stdout.decode(),
+            stdout_bytes=process_result.stdout,
             stdout_digest=process_result.stdout_digest,
-            stderr=process_result.stderr.decode(),
+            stderr_bytes=process_result.stderr,
             stderr_digest=process_result.stderr_digest,
             addresses=tuple(field_set.address for field_set in batch.elements),
             output_setting=output_setting,
@@ -180,7 +193,9 @@ class TestResult(EngineAwareReturnType):
             xml_results=xml_results,
             extra_output=extra_output,
             log_extra_output=log_extra_output,
+            output_simplifier=output_simplifier,
             partition_description=batch.partition_metadata.description,
+            process_results=process_results,
         )
 
     @property
@@ -223,6 +238,17 @@ class TestResult(EngineAwareReturnType):
             return LogLevel.DEBUG
         return LogLevel.INFO if self.exit_code == 0 else LogLevel.ERROR
 
+    def _simplified_output(self, v: bytes) -> str:
+        return self.output_simplifier.simplify(v.decode(errors="replace"))
+
+    @memoized_property
+    def stdout_simplified_str(self) -> str:
+        return self._simplified_output(self.stdout_bytes)
+
+    @memoized_property
+    def stderr_simplified_str(self) -> str:
+        return self._simplified_output(self.stderr_bytes)
+
     def message(self) -> str:
         if self.exit_code is None:
             return "no tests found."
@@ -235,10 +261,10 @@ class TestResult(EngineAwareReturnType):
         ):
             return message
         output = ""
-        if self.stdout:
-            output += f"\n{self.stdout}"
-        if self.stderr:
-            output += f"\n{self.stderr}"
+        if self.stdout_bytes:
+            output += f"\n{self.stdout_simplified_str}"
+        if self.stderr_bytes:
+            output += f"\n{self.stderr_simplified_str}"
         if output:
             output = f"{output.rstrip()}\n\n"
         return f"{message}{output}"
@@ -520,7 +546,7 @@ class TestSubsystem(GoalSubsystem):
             The interactive process used will be immediately blocked waiting for a client before
             continuing.
 
-            This option implies --debug.
+            This option implies `--debug`.
             """
         ),
     )
@@ -545,7 +571,7 @@ class TestSubsystem(GoalSubsystem):
             """
         ),
     )
-    report = BoolOption(default=False, advanced=True, help="Write test reports to --report-dir.")
+    report = BoolOption(default=False, advanced=True, help="Write test reports to `--report-dir`.")
     default_report_path = str(PurePath("{distdir}", "test", "reports"))
     _report_dir = StrOption(
         default=default_report_path,
@@ -564,7 +590,7 @@ class TestSubsystem(GoalSubsystem):
             discarded.
 
             Useful for splitting large numbers of test files across multiple machines in CI.
-            For example, you can run three shards with --shard=0/3, --shard=1/3, --shard=2/3.
+            For example, you can run three shards with `--shard=0/3`, `--shard=1/3`, `--shard=2/3`.
 
             Note that the shards are roughly equal in size as measured by number of files.
             No attempt is made to consider the size of different files, the time they have
@@ -598,6 +624,16 @@ class TestSubsystem(GoalSubsystem):
         advanced=True,
         help="The maximum timeout (in seconds) that may be used on a test target.",
     )
+    attempts_default = IntOption(
+        default=1,
+        help=softwrap(
+            """
+            The number of attempts to run tests, in case of a test failure.
+            Tests that were retried will include the number of attempts in the summary output.
+            """
+        ),
+    )
+
     batch_size = IntOption(
         "--batch-size",
         default=128,
@@ -612,19 +648,37 @@ class TestSubsystem(GoalSubsystem):
             and then this may be further divided into smaller batches, based on this option.
             This is done:
 
-                1. to avoid OS argument length limits (in processes which don't support argument files)
-                2. to support more stable cache keys than would be possible if all files were operated \
-                    on in a single batch
-                3. to allow for parallelism in test runners which don't have internal \
-                    parallelism, or -- if they do support internal parallelism -- to improve scheduling \
-                    behavior when multiple processes are competing for cores and so internal parallelism \
-                    cannot be used perfectly
+              1. to avoid OS argument length limits (in processes which don't support argument files)
+              2. to support more stable cache keys than would be possible if all files were operated \
+                 on in a single batch
+              3. to allow for parallelism in test runners which don't have internal \
+                 parallelism, or -- if they do support internal parallelism -- to improve scheduling \
+                 behavior when multiple processes are competing for cores and so internal parallelism \
+                 cannot be used perfectly
 
             In order to improve cache hit rates (see 2.), batches are created at stable boundaries,
             and so this value is only a "target" max batch size (rather than an exact value).
 
             NOTE: This parameter has no effect on test runners/plugins that do not implement support
             for batched testing.
+            """
+        ),
+    )
+
+    show_rerun_command = BoolOption(
+        default="CI" in os.environ,
+        advanced=True,
+        help=softwrap(
+            f"""
+            If tests fail, show an appropriate `{bin_name()} {name} ...` invocation to rerun just
+            those tests.
+
+            This is to make it easy to run those tests on a new machine (for instance, run tests
+            locally if they fail in CI): caching of successful tests means that rerunning the exact
+            same command on the same machine will already automatically only rerun the failures.
+
+            This defaults to `True` when running in CI (as determined by the `CI` environment
+            variable being set) but `False` elsewhere.
             """
         ),
     )
@@ -650,7 +704,7 @@ class TestTimeoutField(IntField, metaclass=ABCMeta):
     alias = "timeout"
     required = False
     valid_numbers = ValidNumbers.positive_only
-    help = softwrap(
+    help = help_text(
         """
         A timeout (in seconds) used by each test file belonging to this target.
 
@@ -676,7 +730,7 @@ class TestTimeoutField(IntField, metaclass=ABCMeta):
 
 class TestExtraEnvVarsField(StringSequenceField, metaclass=ABCMeta):
     alias = "extra_env_vars"
-    help = softwrap(
+    help = help_text(
         """
          Additional environment variables to include in test processes.
 
@@ -687,8 +741,48 @@ class TestExtraEnvVarsField(StringSequenceField, metaclass=ABCMeta):
         """
     )
 
+    def sorted(self) -> tuple[str, ...]:
+        return tuple(sorted(self.value or ()))
 
-@rule_helper
+
+class TestsBatchCompatibilityTagField(StringField, metaclass=ABCMeta):
+    alias = "batch_compatibility_tag"
+
+    @classmethod
+    def format_help(cls, target_name: str, test_runner_name: str) -> str:
+        return f"""
+        An arbitrary value used to mark the test files belonging to this target as valid for
+        batched execution.
+
+        It's _sometimes_ safe to run multiple `{target_name}`s within a single test runner process,
+        and doing so can give significant wins by allowing reuse of expensive test setup /
+        teardown logic. To opt into this behavior, set this field to an arbitrary non-empty
+        string on all the `{target_name}` targets that are safe/compatible to run in the same
+        process.
+
+        If this field is left unset on a target, the target is assumed to be incompatible with
+        all others and will run in a dedicated `{test_runner_name}` process.
+
+        If this field is set on a target, and its value is different from the value on some
+        other test `{target_name}`, then the two targets are explicitly incompatible and are guaranteed
+        to not run in the same `{test_runner_name}` process.
+
+        If this field is set on a target, and its value is the same as the value on some other
+        `{target_name}`, then the two targets are explicitly compatible and _may_ run in the same
+        test runner process. Compatible tests may not end up in the same test runner batch if:
+
+          * There are "too many" compatible tests in a partition, as determined by the \
+            `[test].batch_size` config parameter, or
+          * Compatible tests have some incompatibility in Pants metadata (i.e. different \
+            `resolve`s or `extra_env_vars`).
+
+        When tests with the same `batch_compatibility_tag` have incompatibilities in some other
+        Pants metadata, they will be automatically split into separate batches. This way you can
+        set a high-level `batch_compatibility_tag` using `__defaults__` and then have tests
+        continue to work as you tweak BUILD metadata on specific targets.
+        """
+
+
 async def _get_test_batches(
     core_request_types: Iterable[type[TestRequest]],
     targets_to_field_sets: TargetRootsToFieldSets,
@@ -724,38 +818,35 @@ async def _get_test_batches(
         for partition in partitions
         for batch in partition_sequentially(
             partition.elements,
-            key=lambda x: str(x),
+            key=lambda x: str(x.address) if isinstance(x, FieldSet) else str(x),
             size_target=test_subsystem.batch_size,
             size_max=2 * test_subsystem.batch_size,
         )
     ]
 
 
-@rule_helper
 async def _run_debug_tests(
     batches: Iterable[TestRequest.Batch],
+    environment_names: Sequence[EnvironmentName],
     test_subsystem: TestSubsystem,
     debug_adapter: DebugAdapterSubsystem,
-    local_environment_name: ChosenLocalEnvironmentName,
 ) -> Test:
-    # TODO: Because these are interactive, they are always pinned to the local environment.
-    # See https://github.com/pantsbuild/pants/issues/17182
     debug_requests = await MultiGet(
         (
             Get(
                 TestDebugRequest,
-                {batch: TestRequest.Batch, local_environment_name.val: EnvironmentName},
+                {batch: TestRequest.Batch, environment_name: EnvironmentName},
             )
             if not test_subsystem.debug_adapter
             else Get(
                 TestDebugAdapterRequest,
-                {batch: TestRequest.Batch, local_environment_name.val: EnvironmentName},
+                {batch: TestRequest.Batch, environment_name: EnvironmentName},
             )
         )
-        for batch in batches
+        for batch, environment_name in zip(batches, environment_names)
     )
     exit_code = 0
-    for debug_request in debug_requests:
+    for debug_request, environment_name in zip(debug_requests, environment_names):
         if test_subsystem.debug_adapter:
             logger.info(
                 softwrap(
@@ -770,7 +861,7 @@ async def _run_debug_tests(
             InteractiveProcessResult,
             {
                 debug_request.process: InteractiveProcess,
-                local_environment_name.val: EnvironmentName,
+                environment_name: EnvironmentName,
             },
         )
         if debug_result.exit_code != 0:
@@ -819,11 +910,6 @@ async def run_tests(
         test_subsystem,
     )
 
-    if test_subsystem.debug or test_subsystem.debug_adapter:
-        return await _run_debug_tests(
-            test_batches, test_subsystem, debug_adapter, local_environment_name
-        )
-
     environment_names = await MultiGet(
         Get(
             EnvironmentName,
@@ -833,9 +919,21 @@ async def run_tests(
         for batch in test_batches
     )
 
+    if test_subsystem.debug or test_subsystem.debug_adapter:
+        return await _run_debug_tests(
+            test_batches, environment_names, test_subsystem, debug_adapter
+        )
+
+    to_test = list(zip(test_batches, environment_names))
     results = await MultiGet(
-        Get(TestResult, {batch: TestRequest.Batch, environment_name: EnvironmentName})
-        for batch, environment_name in zip(test_batches, environment_names)
+        Get(
+            TestResult,
+            {
+                batch: TestRequest.Batch,
+                environment_name: EnvironmentName,
+            },
+        )
+        for batch, environment_name in to_test
     )
 
     # Print summary.
@@ -864,6 +962,10 @@ async def run_tests(
                 logger.info(
                     f"Wrote extra output from test `{result.addresses[0]}` to `{path_prefix}`."
                 )
+
+    rerun_command = _format_test_rerun_command(results)
+    if rerun_command and test_subsystem.show_rerun_command:
+        console.print_stderr(f"\n{rerun_command}")
 
     if test_subsystem.report:
         report_dir = test_subsystem.report_dir(distdir)
@@ -936,7 +1038,7 @@ async def run_tests(
 
 _SOURCE_MAP = {
     ProcessResultMetadata.Source.MEMOIZED: "memoized",
-    ProcessResultMetadata.Source.RAN_REMOTELY: "ran remotely",
+    ProcessResultMetadata.Source.RAN: "ran",
     ProcessResultMetadata.Source.HIT_LOCALLY: "cached locally",
     ProcessResultMetadata.Source.HIT_REMOTELY: "cached remotely",
 }
@@ -947,15 +1049,37 @@ def _format_test_summary(result: TestResult, run_id: RunId, console: Console) ->
     assert (
         result.result_metadata is not None
     ), "Skipped test results should not be outputted in the test summary"
-    if result.exit_code == 0:
-        sigil = console.sigil_succeeded()
+    succeeded = result.exit_code == 0
+    retried = len(result.process_results) > 1
+
+    if succeeded:
+        if not retried:
+            sigil = console.sigil_succeeded()
+        else:
+            sigil = console.sigil_succeeded_with_edits()
         status = "succeeded"
     else:
         sigil = console.sigil_failed()
         status = "failed"
 
-    source = _SOURCE_MAP.get(result.result_metadata.source(run_id))
-    source_print = f" ({source})" if source else ""
+    if retried:
+        attempt_msg = f" after {len(result.process_results)} attempts"
+    else:
+        attempt_msg = ""
+
+    environment = result.result_metadata.execution_environment.name
+    environment_type = result.result_metadata.execution_environment.environment_type
+    source = result.result_metadata.source(run_id)
+    source_str = _SOURCE_MAP[source]
+    if environment:
+        preposition = "in" if source == ProcessResultMetadata.Source.RAN else "for"
+        source_desc = (
+            f" ({source_str} {preposition} {environment_type} environment `{environment}`)"
+        )
+    elif source == ProcessResultMetadata.Source.RAN:
+        source_desc = ""
+    else:
+        source_desc = f" ({source_str})"
 
     elapsed_print = ""
     total_elapsed_ms = result.result_metadata.total_elapsed_ms
@@ -963,8 +1087,20 @@ def _format_test_summary(result: TestResult, run_id: RunId, console: Console) ->
         elapsed_secs = total_elapsed_ms / 1000
         elapsed_print = f"in {elapsed_secs:.2f}s"
 
-    suffix = f" {elapsed_print}{source_print}"
-    return f"{sigil} {result.description} {status}{suffix}."
+    return f"{sigil} {result.description} {status}{attempt_msg} {elapsed_print}{source_desc}."
+
+
+def _format_test_rerun_command(results: Iterable[TestResult]) -> None | str:
+    failures = [result for result in results if result.exit_code not in (None, 0)]
+    if not failures:
+        return None
+
+    # format an invocation like `pants test path/to/first:address path/to/second:address ...`
+    addresses = sorted(shlex.quote(str(addr)) for result in failures for addr in result.addresses)
+    goal = f"{bin_name()} {TestSubsystem.name}"
+    invocation = " ".join([goal, *addresses])
+
+    return f"To rerun the failing tests, use:\n\n    {invocation}"
 
 
 @dataclass(frozen=True)
@@ -983,7 +1119,7 @@ async def get_filtered_environment(test_env_aware: TestSubsystem.EnvironmentAwar
 def _unsupported_debug_rules(cls: type[TestRequest]) -> Iterable:
     """Returns a rule that implements TestDebugRequest by raising an error."""
 
-    @rule(_param_type_overrides={"request": cls.Batch})
+    @rule(canonical_name_suffix=cls.__name__, _param_type_overrides={"request": cls.Batch})
     async def get_test_debug_request(request: TestRequest.Batch) -> TestDebugRequest:
         raise NotImplementedError("Testing this target with --debug is not yet supported.")
 
@@ -994,7 +1130,7 @@ def _unsupported_debug_rules(cls: type[TestRequest]) -> Iterable:
 def _unsupported_debug_adapter_rules(cls: type[TestRequest]) -> Iterable:
     """Returns a rule that implements TestDebugAdapterRequest by raising an error."""
 
-    @rule(_param_type_overrides={"request": cls.Batch})
+    @rule(canonical_name_suffix=cls.__name__, _param_type_overrides={"request": cls.Batch})
     async def get_test_debug_adapter_request(request: TestRequest.Batch) -> TestDebugAdapterRequest:
         raise NotImplementedError(
             "Testing this target type with a debug adapter is not yet supported."
@@ -1010,7 +1146,7 @@ def _unsupported_debug_adapter_rules(cls: type[TestRequest]) -> Iterable:
 
 class RuntimePackageDependenciesField(SpecialCasedDependencies):
     alias = "runtime_package_dependencies"
-    help = softwrap(
+    help = help_text(
         f"""
         Addresses to targets that can be built with the `{bin_name()} package` goal and whose
         resulting artifacts should be included in the test run.
@@ -1020,7 +1156,7 @@ class RuntimePackageDependenciesField(SpecialCasedDependencies):
         have, but without the `--distdir` prefix (e.g. `dist/`).
 
         You can include anything that can be built by `{bin_name()} package`, e.g. a `pex_binary`,
-        `python_awslambda`, or an `archive`.
+        `python_aws_lambda_function`, or an `archive`.
         """
     )
 
@@ -1046,7 +1182,8 @@ async def build_runtime_package_dependencies(
         FieldSetsPerTarget, FieldSetsPerTargetRequest(PackageFieldSet, tgts)
     )
     packages = await MultiGet(
-        Get(BuiltPackage, PackageFieldSet, field_set) for field_set in field_sets_per_tgt.field_sets
+        Get(BuiltPackage, EnvironmentAwarePackageRequest(field_set))
+        for field_set in field_sets_per_tgt.field_sets
     )
     return BuiltPackageDependencies(packages)
 

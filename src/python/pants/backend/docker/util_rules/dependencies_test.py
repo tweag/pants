@@ -8,7 +8,7 @@ import pytest
 from pants.backend.docker.goals import package_image
 from pants.backend.docker.subsystems import dockerfile_parser
 from pants.backend.docker.target_types import DockerImageDependenciesField, DockerImageTarget
-from pants.backend.docker.util_rules import dockerfile
+from pants.backend.docker.util_rules import docker_build_args, dockerfile
 from pants.backend.docker.util_rules.dependencies import (
     InferDockerDependencies,
     infer_docker_dependencies,
@@ -20,6 +20,7 @@ from pants.backend.python.goals import package_pex_binary
 from pants.backend.python.target_types import PexBinariesGeneratorTarget, PexBinary
 from pants.backend.python.util_rules import pex
 from pants.core.goals import package
+from pants.core.target_types import FileTarget
 from pants.engine.addresses import Address
 from pants.engine.target import GenerateTargetsRequest, InferredDependencies
 from pants.engine.unions import UnionRule
@@ -32,6 +33,7 @@ def rule_runner() -> RuleRunner:
         rules=[
             *dockerfile.rules(),
             *dockerfile_parser.rules(),
+            *docker_build_args.rules(),
             package.find_all_packageable_targets,
             *package_image.rules(),
             *package_pex_binary.rules(),
@@ -47,6 +49,7 @@ def rule_runner() -> RuleRunner:
             PexBinary,
             PexBinariesGeneratorTarget,
             GoBinaryTarget,
+            FileTarget,
         ],
     )
     rule_runner.set_options(
@@ -94,11 +97,16 @@ def test_infer_docker_dependencies(files, rule_runner: RuleRunner) -> None:
     dockerfile_content = dedent(
         """\
             ARG BASE_IMAGE=:base
+            ARG PEX_BIN=project/hello/main/py:from_arg
+            ARG PEX_BIN_DOTTED_PATH=project.hello.main.py/from_arg_dotted_path.pex
             FROM $BASE_IMAGE
             ENTRYPOINT ["./entrypoint"]
             COPY project.hello.main.py/main_binary.pex /entrypoint
             COPY project.hello.main.py/cmd1_py.pex /entrypoint
             COPY project.hello.main.go/go_bin /entrypoint
+            COPY ${PEX_BIN} /entrypoint
+            COPY ${PEX_BIN_DOTTED_PATH} /entrypoint
+            COPY project/hello/main/files/msg.txt /entrypoint
         """
     )
 
@@ -112,11 +120,23 @@ def test_infer_docker_dependencies(files, rule_runner: RuleRunner) -> None:
                 """\
                 pex_binary(name="main_binary")
                 pex_binaries(name="cmds", entry_points=["cmd1.py"])
+                pex_binary(name="from_arg")
+                pex_binary(name="from_arg_dotted_path")
                 """
             ),
             "project/hello/main/go/BUILD": dedent(
                 """\
                 go_binary(name="go_bin")
+                """
+            ),
+            "project/hello/main/files/BUILD": dedent(
+                """\
+                file(name="file", source="msg.txt")
+                """
+            ),
+            "project/hello/main/files/msg.txt": dedent(
+                """\
+                Some text. This file needs to exist so that RawSpecs(file_literals=...) can find this file
                 """
             ),
         }
@@ -133,5 +153,45 @@ def test_infer_docker_dependencies(files, rule_runner: RuleRunner) -> None:
             Address("project/hello/main/py", target_name="main_binary"),
             Address("project/hello/main/py", target_name="cmds", generated_name="cmd1.py"),
             Address("project/hello/main/go", target_name="go_bin"),
+            Address("project/hello/main/py", target_name="from_arg"),
+            Address("project/hello/main/py", target_name="from_arg_dotted_path"),
+            Address("project/hello/main/files", target_name="file"),
         ]
     )
+
+
+def test_does_not_infer_dependency_when_docker_build_arg_overwrites(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            "src/upstream/BUILD": dedent(
+                """\
+                docker_image(
+                  name="image",
+                  repository="upstream/{name}",
+                  image_tags=["1.0"],
+                  instructions=["FROM alpine:3.16.1"],
+                )
+                """
+            ),
+            "src/downstream/BUILD": "docker_image(name='image')",
+            "src/downstream/Dockerfile": dedent(
+                """\
+                ARG BASE_IMAGE=src/upstream:image
+                FROM $BASE_IMAGE
+                """
+            ),
+        }
+    )
+
+    tgt = rule_runner.get_target(Address("src/downstream", target_name="image"))
+    rule_runner.set_options(
+        ["--docker-build-args=BASE_IMAGE=alpine:3.17.0"],
+        env_inherit={"PATH", "PYENV_ROOT", "HOME"},
+    )
+    inferred = rule_runner.request(
+        InferredDependencies,
+        [InferDockerDependencies(tgt[DockerImageDependenciesField])],
+    )
+    assert inferred == InferredDependencies([])

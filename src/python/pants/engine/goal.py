@@ -1,15 +1,16 @@
 # Copyright 2019 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
+from __future__ import annotations
 
 from abc import abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, Type, cast
 
 from typing_extensions import final
 
-from pants.base.deprecated import deprecated_conditional
+from pants.engine.engine_aware import EngineAwareReturnType
 from pants.engine.unions import UnionMembership
 from pants.option.option_types import StrOption
 from pants.option.scope import ScopeInfo
@@ -78,29 +79,22 @@ class Goal:
     ```
 
     Since `@goal_rules` always run in order to produce side effects (generally: console output),
-    they are not cacheable, and the `Goal` product of a `@goal_rule` contains only a exit_code
+    they are not cacheable, and the `Goal` product of a `@goal_rule` contains only an exit_code
     value to indicate whether the rule exited cleanly.
     """
 
     class EnvironmentBehavior(Enum):
-        """Indicates that a goal's behavior with respect to environments has not been considered.
+        """Indicates that the goal will always operate on the local environment target.
 
-        If set, will trigger a deprecation warning. If the desired behavior is to stay pinned to
-        defaults, changing to `LOCAL_ONLY` will silence the warning for this goal.
+        This is largely the same behavior as Pants has had pre-2.15.
         """
 
-        UNMIGRATED = 1
-
-        """ Indicates that the goal will always operate on the local environment target.
-
-        This is largely the same behavior as Pants has had pre-2.15. Set to this value to silence
-        the deprecation warning that arises from using `UNMIGRATED`."""
         LOCAL_ONLY = 2
 
         f""" Indicates that the goal chooses the environments to use to execute rules within the goal.
 
         This requires migration work to be done by the goal author. See
-        {doc_url('plugin-upgrade-guide')}.
+        {doc_url('docs/writing-plugins/common-plugin-tasks/plugin-upgrade-guide')}.
         """
         USES_ENVIRONMENTS = 3
 
@@ -110,21 +104,14 @@ class Goal:
     f"""Indicates that a Goal has been migrated to compute EnvironmentNames to build targets in.
 
     All goals in `pantsbuild/pants` should be migrated before the 2.15.x branch is cut, but end
-    user goals have until `2.17.0.dev0` to migrate.
+    user goals have until `2.17.0.dev4` to migrate.
 
-    See {doc_url('plugin-upgrade-guide')}.
+    See {doc_url('docs/writing-plugins/common-plugin-tasks/plugin-upgrade-guide')}.
     """
-    environment_behavior: ClassVar[EnvironmentBehavior] = EnvironmentBehavior.UNMIGRATED
+    environment_behavior: ClassVar[EnvironmentBehavior]
 
     @classmethod
     def _selects_environments(cls) -> bool:
-        deprecated_conditional(
-            lambda: cls.environment_behavior == Goal.EnvironmentBehavior.UNMIGRATED,
-            "2.17.0.dev0",
-            f"Setting `Goal.environment_behavior=EnvironmentBehavior.UNMIGRATED` for `Goal` "
-            f"`{cls.name}`",
-            hint=f"See {doc_url('plugin-upgrade-guide')}\n",
-        )
         return cls.environment_behavior == Goal.EnvironmentBehavior.USES_ENVIRONMENTS
 
     @final
@@ -149,7 +136,7 @@ class Outputting:
 
     @final
     @contextmanager
-    def output(self, console: "Console") -> Iterator[Callable[[str], None]]:
+    def output(self, console: Console) -> Iterator[Callable[[str], None]]:
         """Given a Console, yields a function for writing data to stdout, or a file.
 
         The passed options instance will generally be the `Goal.Options` of an `Outputting` `Goal`.
@@ -159,7 +146,7 @@ class Outputting:
 
     @final
     @contextmanager
-    def output_sink(self, console: "Console") -> Iterator:
+    def output_sink(self, console: Console) -> Iterator:
         stdout_file = None
         if self.output_file:
             stdout_file = open(self.output_file, "w")
@@ -183,7 +170,7 @@ class LineOriented(Outputting):
 
     @final
     @contextmanager
-    def line_oriented(self, console: "Console") -> Iterator[Callable[[str], None]]:
+    def line_oriented(self, console: Console) -> Iterator[Callable[[str], None]]:
         """Given a Console, yields a function for printing lines to stdout or a file.
 
         The passed options instance will generally be the `Goal.Options` of an `Outputting` `Goal`.
@@ -191,3 +178,25 @@ class LineOriented(Outputting):
         sep = self.sep.encode().decode("unicode_escape")
         with self.output_sink(console) as output_sink:
             yield lambda msg: print(msg, file=output_sink, end=sep)
+
+
+@dataclass(frozen=True)
+class CurrentExecutingGoals(EngineAwareReturnType):
+    executing: dict[str, type[Goal]] = field(default_factory=dict)
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.executing.keys()))
+
+    def is_running(self, goal: str) -> bool:
+        return goal in self.executing
+
+    @contextmanager
+    def _execute(self, goal: type[Goal]) -> Iterator[None]:
+        self.executing[goal.name] = goal
+        try:
+            yield
+        finally:
+            self.executing.pop(goal.name, None)
+
+    def cacheable(self) -> bool:
+        return False

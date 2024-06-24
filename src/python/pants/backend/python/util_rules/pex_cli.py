@@ -4,18 +4,17 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import os.path
 from dataclasses import dataclass
 from typing import Iterable, List, Mapping, Optional, Tuple
 
 from pants.backend.python.subsystems.python_native_code import PythonNativeCodeSubsystem
 from pants.backend.python.subsystems.setup import PythonSetup
 from pants.backend.python.util_rules import pex_environment
-from pants.backend.python.util_rules.pex_environment import (
-    PexEnvironment,
-    PexSubsystem,
-    PythonExecutable,
-)
-from pants.core.util_rules import external_tool
+from pants.backend.python.util_rules.pex_environment import PexEnvironment, PexSubsystem
+from pants.core.util_rules import adhoc_binaries, external_tool
+from pants.core.util_rules.adhoc_binaries import PythonBuildStandaloneBinary
 from pants.core.util_rules.external_tool import (
     DownloadedExternalTool,
     ExternalToolRequest,
@@ -29,18 +28,19 @@ from pants.engine.rules import Get, collect_rules, rule
 from pants.option.global_options import GlobalOptions, ca_certs_path_to_file_content
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
-from pants.util.meta import classproperty, frozen_after_init
-from pants.util.strutil import create_path_env_var
+from pants.util.meta import classproperty
+
+logger = logging.getLogger(__name__)
 
 
 class PexCli(TemplatedExternalTool):
     options_scope = "pex-cli"
     name = "pex"
-    help = "The PEX (Python EXecutable) tool (https://github.com/pantsbuild/pex)."
+    help = "The PEX (Python EXecutable) tool (https://github.com/pex-tool/pex)."
 
-    default_version = "v2.1.116"
-    default_url_template = "https://github.com/pantsbuild/pex/releases/download/{version}/pex"
-    version_constraints = ">=2.1.116,<3.0"
+    default_version = "v2.3.3"
+    default_url_template = "https://github.com/pex-tool/pex/releases/download/{version}/pex"
+    version_constraints = ">=2.3.0,<3.0"
 
     @classproperty
     def default_known_versions(cls):
@@ -49,26 +49,23 @@ class PexCli(TemplatedExternalTool):
                 (
                     cls.default_version,
                     plat,
-                    "3158c6ab70272f836daade412974e791a069af2eb1d43aee9c10cfdf63154385",
-                    "4068322",
+                    "929732cde0b2bc933a5c4819a179cbbefb50186c2f8ecdd8296e4a893feb5432",
+                    "4134920",
                 )
             )
             for plat in ["macos_arm64", "macos_x86_64", "linux_x86_64", "linux_arm64"]
         ]
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class PexCliProcess:
     subcommand: tuple[str, ...]
     extra_args: tuple[str, ...]
-    set_resolve_args: bool
     description: str = dataclasses.field(compare=False)
     additional_input_digest: Optional[Digest]
     extra_env: Optional[FrozenDict[str, str]]
     output_files: Optional[Tuple[str, ...]]
     output_directories: Optional[Tuple[str, ...]]
-    python: Optional[PythonExecutable]
     level: LogLevel
     concurrency_available: int
     cache_scope: ProcessCacheScope
@@ -79,28 +76,27 @@ class PexCliProcess:
         subcommand: Iterable[str],
         extra_args: Iterable[str],
         description: str,
-        set_resolve_args: bool = True,
         additional_input_digest: Optional[Digest] = None,
         extra_env: Optional[Mapping[str, str]] = None,
         output_files: Optional[Iterable[str]] = None,
         output_directories: Optional[Iterable[str]] = None,
-        python: Optional[PythonExecutable] = None,
         level: LogLevel = LogLevel.INFO,
         concurrency_available: int = 0,
         cache_scope: ProcessCacheScope = ProcessCacheScope.SUCCESSFUL,
     ) -> None:
-        self.subcommand = tuple(subcommand)
-        self.extra_args = tuple(extra_args)
-        self.set_resolve_args = set_resolve_args
-        self.description = description
-        self.additional_input_digest = additional_input_digest
-        self.extra_env = FrozenDict(extra_env) if extra_env else None
-        self.output_files = tuple(output_files) if output_files else None
-        self.output_directories = tuple(output_directories) if output_directories else None
-        self.python = python
-        self.level = level
-        self.concurrency_available = concurrency_available
-        self.cache_scope = cache_scope
+        object.__setattr__(self, "subcommand", tuple(subcommand))
+        object.__setattr__(self, "extra_args", tuple(extra_args))
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "additional_input_digest", additional_input_digest)
+        object.__setattr__(self, "extra_env", FrozenDict(extra_env) if extra_env else None)
+        object.__setattr__(self, "output_files", tuple(output_files) if output_files else None)
+        object.__setattr__(
+            self, "output_directories", tuple(output_directories) if output_directories else None
+        )
+        object.__setattr__(self, "level", level)
+        object.__setattr__(self, "concurrency_available", concurrency_available)
+        object.__setattr__(self, "cache_scope", cache_scope)
+
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -123,6 +119,7 @@ async def setup_pex_cli_process(
     request: PexCliProcess,
     pex_pex: PexPEX,
     pex_env: PexEnvironment,
+    bootstrap_python: PythonBuildStandaloneBinary,
     python_native_code: PythonNativeCodeSubsystem.EnvironmentAware,
     global_options: GlobalOptions,
     pex_subsystem: PexSubsystem,
@@ -144,7 +141,7 @@ async def setup_pex_cli_process(
     input_digest = await Get(Digest, MergeDigests(digests_to_merge))
 
     global_args = [
-        # Ensure Pex and its subprocesses create temporary files in the the process execution
+        # Ensure Pex and its subprocesses create temporary files in the process execution
         # sandbox. It may make sense to do this generally for Processes, but in the short term we
         # have known use cases where /tmp is too small to hold large wheel downloads Pex is asked to
         # perform. Making the TMPDIR local to the sandbox allows control via
@@ -162,21 +159,24 @@ async def setup_pex_cli_process(
 
     verbosity_args = [f"-{'v' * pex_subsystem.verbosity}"] if pex_subsystem.verbosity > 0 else []
 
-    resolve_args = (
-        [*cert_args, "--python-path", create_path_env_var(pex_env.interpreter_search_paths)]
-        if request.set_resolve_args
-        else []
-    )
+    warnings_args = [] if pex_subsystem.emit_warnings else ["--no-emit-warnings"]
+
+    # NB: We should always pass `--python-path`, as that tells Pex where to look for interpreters
+    # when `--python` isn't an absolute path.
+    resolve_args = [
+        *cert_args,
+        "--python-path",
+        os.pathsep.join(pex_env.interpreter_search_paths),
+    ]
     # All old-style pex runs take the --pip-version flag, but only certain subcommands of the
     # `pex3` console script do. So if invoked with a subcommand, the caller must selectively
     # set --pip-version only on subcommands that take it.
-    pip_version_args = (
-        [] if request.subcommand else ["--pip-version", python_setup.pip_version.value]
-    )
+    pip_version_args = [] if request.subcommand else ["--pip-version", python_setup.pip_version]
     args = [
         *request.subcommand,
         *global_args,
         *verbosity_args,
+        *warnings_args,
         *pip_version_args,
         *resolve_args,
         # NB: This comes at the end because it may use `--` passthrough args, # which must come at
@@ -185,9 +185,9 @@ async def setup_pex_cli_process(
     ]
 
     complete_pex_env = pex_env.in_sandbox(working_directory=None)
-    normalized_argv = complete_pex_env.create_argv(pex_pex.exe, *args, python=request.python)
+    normalized_argv = complete_pex_env.create_argv(pex_pex.exe, *args)
     env = {
-        **complete_pex_env.environment_dict(python_configured=request.python is not None),
+        **complete_pex_env.environment_dict(python=bootstrap_python),
         **python_native_code.subprocess_env_vars,
         **(request.extra_env or {}),
         # If a subcommand is used, we need to use the `pex3` console script.
@@ -208,9 +208,19 @@ async def setup_pex_cli_process(
     )
 
 
+def maybe_log_pex_stderr(stderr: bytes, pex_verbosity: int) -> None:
+    """Forward Pex's stderr to a Pants logger if conditions are met."""
+    log_output = stderr.decode()
+    if log_output and "PEXWarning:" in log_output:
+        logger.warning("%s", log_output)
+    elif log_output and pex_verbosity > 0:
+        logger.info("%s", log_output)
+
+
 def rules():
     return [
         *collect_rules(),
         *external_tool.rules(),
         *pex_environment.rules(),
+        *adhoc_binaries.rules(),
     ]

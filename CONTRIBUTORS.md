@@ -1,26 +1,41 @@
-Created by running `./pants run build-support/bin/contributors.py`.
+Created as part of the release process.
 
 + A. Alonso Dominguez
++ APL
 + Aaron Mitchell
 + Adam Chainz
 + Adam Retter
++ Aditya Raj Verma
 + Alan Paulin
 + Alan Velasco
++ Alex Bancroft
 + Alex Schmitt
 + Alexander Johnson
++ Alexander Kuhn-Regnier
 + Alexey Tereshenkov
++ Alisha Parveen
 + Andreas Stenius
 + Andrew Hamilton
++ Andrii Porokhnavets
 + Andy Reitz
++ Anler
 + Antoine Tollenaere
 + Asher Foa
++ Aurelien Didier
++ Axel Goblet
++ Baptiste Gentholz
 + Bardur Arantsson
 + Bastian Wegge
++ Ben Limmer
 + Benjy Weinberger
++ Berkay Öztürk
 + Bill Farner
 + Billy "Hyun Joon" Seol
++ Blaž Šnuderl
++ Bob Gregory
 + Borja Lorente
 + Brandon Milton
++ Brandon Novick
 + Brian Larson
 + Brian Wickman
 + Bruno Bieth
@@ -36,13 +51,16 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Chris Heisterkamp
 + Chris Livingston
 + Chris Pesto
++ Chris Smith
 + Chris Targett
 + Chris Williams
++ Christoph Proeschel
 + Christopher Livingston
 + Christopher Maier
 + Christopher Neugebauer
 + Cody Gibb
 + Colin Taylor
++ Constantin Ponfick
 + Craig Schertz
 + Cristian Matache
 + Damon Revoe
@@ -61,6 +79,7 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + David Taylor
 + David Turner
 + Derek Young
++ Dimitar Kovachev
 + Dimitrios Bariamis
 + Divij Rajkumar
 + Dominic Hamon
@@ -69,6 +88,7 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Drew Rothstein
 + Dumitru Daniliuc
 + Dylan Herman
++ Dương Đỗ Minh Châu
 + Ebube Chuba
 + Eitan Adler
 + Ekaterina Tyurina
@@ -81,8 +101,10 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Eugene Burmako
 + Evan Jones
 + Evgeny Kravchenko
++ Facetoe
 + Fatin H
 + Fedor Korotkov
++ Filip Nikolovski
 + Fiona Condone
 + Flo
 + Florian Leibert
@@ -90,29 +112,42 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Gabriel Gonzalez
 + Garrett Malmquist
 + Gary M. Josack
++ Gautham Nair
++ Gerald Spencer
 + Gordon Cassie
++ Greg Niemann
 + Greg Shuflin
++ Gregory Borodin
 + Grzegorz Kossakowski
 + Guy Marom
 + Harley Cooper
++ HeetVekariya
 + Henry Fuller
 + Herbert Rusznak
 + Huon Wilson
 + Hwasung Lee
 + Ian Tabolt
++ Idan Attias
 + Igor Morozov
 + Ikai Lan
 + In-Ho Yi
++ Israël Hallé
 + Itay Donanhirsh
 + Ity Kaul
++ JC (Jonathan Chen)
++ Jack Evans
++ Jack Zhao
 + Jackson Davis
 + Jacob Floyd
 + Jake Donham
++ Jake Zerrer
 + Jakub Bujny
 + James Bench
 + James Koch
 + James Mouradian
++ Jan Berkel
 + Jan Paul Erkelens
++ Jason Barnett
 + Jason Jackson
 + Jason Song
 + Jay Crumb
@@ -124,6 +159,7 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Joe Ennever
 + Joe Smith
 + Johan Oskarsson
++ Johan Sim Jian An
 + John Barry
 + John Basila
 + John Chee
@@ -143,32 +179,47 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Joshua Cannon
 + Joshua Cohen
 + Joshua Humphries
++ Jovial Joe Jayarson
++ Julio Batista Silva
 + Justin Trobec
++ KadenAgrey
 + Karin Lundberg
 + Kaushik Srenevasan
 + Ken Howard
 + Ken Kawamoto
++ Kevin Oliveira
 + Kevin Oliver
 + Kevin Sweeney
++ Koki Nishihara
 + Kris Wilson
++ Krishnan Chandra
 + Kushal Dave
 + Kyle Derr
++ Kyujin Cho
 + Larry Hosken
++ Lasse Alm
 + Lawrence Finn
 + Le Nucksi
 + Lei Wang
 + Leo Kim
 + Lex Spoon
++ Li Li
++ Liam Deacon
 + Liam Wilson
 + Luc Cary
 + Luca Clementi
 + Lukasz Jastrzebski
++ Mahesh Vashishtha
 + Marc Abramowitz
 + Marcelo Trylesinski
 + Marcin Podolski
++ Marcus Bolmstedt
++ Marcus Lim
 + Marek Żarnowski
++ Marijn Valk
 + Marilyn Cruz
 + Marius Eriksen
++ Marius Räsener
 + Mark Chu-Carroll
 + Mark Davis
 + Mark McBride
@@ -180,25 +231,33 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Matt Landis
 + Matt Olsen
 + Matthew Jeffryes
++ Matthias Berndt
 + Maxim Khutornenko
 + Maxim Popenko
 + Michael Doherty
 + Michael Glass
 + Michal Bryc
++ Mikael Souza
 + Mike Cripps
++ Mike Geeves
 + Mike Lindsey
 + Mike Solomon
 + Misho Krastev
 + Mohamed Abdi
++ Morten Hauge
 + Moses Nakamura
 + Nadav Samet
 + Nathan Levesque
++ Navneeth Jayendran
 + Neeraj Kashyap
 + Neil Sanchala
++ Nicholas Gustafson
 + Nicholas Santos
++ Nick Dellosa
 + Nik Shkrob
 + Nimrod Shlagman
 + Nitay Joffe
++ Nobu
 + Nora Howard
 + Ny Saechao
 + Oliver Gould
@@ -219,12 +278,16 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Pierre Chevalier
 + Pierre DAL-PRA
 + Qicheng Ma
++ Ramon Buckland
++ Raph Estrada
 + Raúl Cuza
++ Rhuan Barreto
 + Rhys Madigan
 + Robert Stapenhurst
 + Roger Jiang
 + Roman Andriadi
 + Rushal Verma
++ Ryan Despain
 + Ryan King
 + Ryan Scott Brown
 + Ryan Williams
@@ -232,29 +295,37 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Sameer Brenn
 + Sara Solano
 + Scott Lessans
++ Scott Searcy
 + Senthil Kumaran
 + SergeKireev
 + Sergey Serebryakov
++ Seve Martinez
 + Shane Delmore
 + Shantanu Kumar
 + Shuo Li
 + Simeon Franklin
++ Simon Biggs
++ Sion Kang
 + Srikanth Kotagiri
 + Stefan Sauer
 + Stephan Erb
 + Stu Hood
++ Subin Kim
 + Suresh Joshi
 + Tal Amuyal
 + Tansy Arron-Walker
 + Ted Dziuba
 + Tejal Desai
 + Thales Menato
++ Theo Ribeiro
 + Tianshuo Deng
 + Tien Nguyen
 + Tim Gates
++ Tim Nielens
 + Tim Treptow
 + Timur Abishev
 + Tina Huang
++ Tobias Nilsson
 + Todd Stumpf
 + Tom Dimiduk
 + Tom Dyas
@@ -262,23 +333,45 @@ Created by running `./pants run build-support/bin/contributors.py`.
 + Tom Solberg
 + Tomasz Godzik
 + Tomasz Pasternak
++ Tony Sherman
 + Travis Crawford
 + Troy Howard
 + Tushar Singh
 + Ugo Di Girolamo
++ Ulugbek Adilbekov
++ Viktor Kleen
++ Vincent Tavernier
 + Walter Scheper
 + Wei An
 + Wilhelmina Drengwitz
++ Willy Lulciuc
 + Win Wang
 + Wolfram Arnold
 + Xaelias
++ Xuanwo
++ Yarden Shoham
 + Yi Cheng
 + Yoav Alon
 + Yuhan GUO
 + Yujie Chen
++ andreaimprovised
++ azban
++ bianca rosa
 + billybecker
++ csqzhang
++ csteiner
 + eugene yokota
++ gyudoza
 + hephex
++ jgartdele/del
++ offsetcyan
++ okcleary
++ olivercoleman-switchdin
++ philipp-sontag-by
++ purajit
++ ravi2024sk
++ sww
 + twunderlich-grapl
 + wimax-grapl
++ yjabri
 + Ólafur Páll Geirsson

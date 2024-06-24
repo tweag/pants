@@ -13,7 +13,7 @@ from pants.engine.fs import Digest, DigestContents, DigestEntries, FileDigest, F
 from pants.engine.goal import Goal, GoalSubsystem
 from pants.engine.internals.native_engine import PyExecutor, PyStubCAS
 from pants.engine.process import Process, ProcessResult
-from pants.engine.rules import Get, SubsystemRule, goal_rule, rule
+from pants.engine.rules import Get, goal_rule, rule
 from pants.option.global_options import CacheContentBehavior, RemoteCacheWarningsBehavior
 from pants.testutil.pants_integration_test import run_pants
 from pants.testutil.rule_runner import QueryRule, RuleRunner
@@ -58,7 +58,7 @@ def test_warns_on_remote_cache_errors() -> None:
 
     def write_err(i: int) -> str:
         return (
-            f'Failed to write to remote cache ({i} occurrences so far): InvalidArgument: "StubCAS is '
+            f'Failed to write to remote cache ({i} occurrences so far): Internal: "StubCAS is '
             f'configured to always fail"'
         )
 
@@ -102,6 +102,17 @@ def test_warns_on_remote_cache_errors() -> None:
         assert err in backoff_result, f"Not found in:\n{backoff_result}"
     for err in [third_read_err, third_write_err]:
         assert err not in backoff_result
+
+    always_result = run(RemoteCacheWarningsBehavior.always)
+    for err in [
+        first_read_err,
+        first_write_err,
+        third_read_err,
+        third_write_err,
+        fourth_read_err,
+        fourth_write_err,
+    ]:
+        assert err in always_result, f"Not found in:\n{always_result}"
 
 
 class ProcessOutputEntries(DigestEntries):
@@ -211,7 +222,7 @@ def test_sync_backtracking() -> None:
     def run() -> dict[str, int]:
         # Use an isolated store to ensure that the only content is in the remote/stub cache.
         rule_runner = RuleRunner(
-            rules=[mock_run, *distdir.rules(), SubsystemRule(MockRunSubsystem)],
+            rules=[mock_run, *distdir.rules(), *MockRunSubsystem.rules()],
             isolated_local_store=True,
             bootstrap_args=[
                 "--cache-content-behavior=defer",
@@ -255,7 +266,7 @@ def test_eager_validation(cache_content_behavior: CacheContentBehavior) -> None:
     def run() -> dict[str, int]:
         # Use an isolated store to ensure that the only content is in the remote/stub cache.
         rule_runner = RuleRunner(
-            rules=[mock_run, *distdir.rules(), SubsystemRule(MockRunSubsystem)],
+            rules=[mock_run, *distdir.rules(), *MockRunSubsystem.rules()],
             isolated_local_store=True,
             bootstrap_args=[
                 f"--cache-content-behavior={cache_content_behavior.value}",

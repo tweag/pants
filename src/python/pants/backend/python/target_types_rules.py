@@ -13,14 +13,18 @@ import os.path
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import chain
-from typing import DefaultDict, Dict, Generator, Optional, Tuple, cast
+from typing import Callable, DefaultDict, Dict, Generator, Optional, Tuple, cast
 
 from pants.backend.python.dependency_inference.module_mapper import (
     PythonModuleOwners,
     PythonModuleOwnersRequest,
 )
-from pants.backend.python.dependency_inference.rules import PythonInferSubsystem, import_rules
-from pants.backend.python.goals.setup_py import InvalidEntryPoint
+from pants.backend.python.dependency_inference.rules import UnownedDependencyError, import_rules
+from pants.backend.python.dependency_inference.subsystem import (
+    AmbiguityResolution,
+    PythonInferSubsystem,
+    UnownedDependencyUsage,
+)
 from pants.backend.python.subsystems.setup import PythonSetup
 from pants.backend.python.target_types import (
     EntryPoint,
@@ -41,7 +45,11 @@ from pants.backend.python.target_types import (
     ResolvePexEntryPointRequest,
     ResolvePythonDistributionEntryPointsRequest,
 )
+from pants.backend.python.util_rules.entry_points import (
+    get_python_distribution_entry_point_unambiguous_module_owners,
+)
 from pants.backend.python.util_rules.interpreter_constraints import interpreter_constraints_contains
+from pants.backend.python.util_rules.package_dists import InvalidEntryPoint
 from pants.engine.addresses import Address, Addresses, UnparsedAddressInputs
 from pants.engine.fs import GlobMatchErrorBehavior, PathGlobs, Paths
 from pants.engine.rules import Get, MultiGet, collect_rules, rule
@@ -231,11 +239,22 @@ async def infer_pex_binary_entry_point_dependency(
     if entry_point.val is None:
         return InferredDependencies([])
 
+    # Only set locality if needed, to avoid unnecessary rule graph memoization misses.
+    # When set, use the source root, which is useful in practice, but incurs fewer memoization
+    # misses than using the full spec_path.
+    locality = None
+    if python_infer_subsystem.ambiguity_resolution == AmbiguityResolution.by_source_root:
+        source_root = await Get(
+            SourceRoot, SourceRootRequest, SourceRootRequest.for_address(request.field_set.address)
+        )
+        locality = source_root.path
+
     owners = await Get(
         PythonModuleOwners,
         PythonModuleOwnersRequest(
             entry_point.val.module,
             resolve=request.field_set.resolve.normalized_value(python_setup),
+            locality=locality,
         ),
     )
     address = request.field_set.address
@@ -257,10 +276,61 @@ async def infer_pex_binary_entry_point_dependency(
     maybe_disambiguated = explicitly_provided_deps.disambiguated(
         owners.ambiguous, owners_must_be_ancestors=entry_point.file_name_used
     )
-    unambiguous_owners = owners.unambiguous or (
-        (maybe_disambiguated,) if maybe_disambiguated else ()
+
+    unambiguous_owners = _determine_entry_point_owner(
+        maybe_disambiguated,
+        owners,
+        unresolved_ambiguity_handler=lambda: _handle_unresolved_pex_entrypoint(
+            address,
+            entry_point_field.value,
+            owners.ambiguous,
+            python_infer_subsystem.unowned_dependency_behavior,
+        ),
     )
     return InferredDependencies(unambiguous_owners)
+
+
+def _determine_entry_point_owner(
+    maybe_disambiguated: Optional[Address],
+    owners: PythonModuleOwners,
+    unresolved_ambiguity_handler: Callable[[], None],
+) -> Tuple[Address, ...]:
+    """Determine what should be the unambiguous owner for a PEX's entrypoint.
+
+    This might be empty.
+    """
+    if owners.unambiguous:
+        return owners.unambiguous
+    elif maybe_disambiguated:
+        return (maybe_disambiguated,)
+    elif owners.ambiguous and not maybe_disambiguated:
+        unresolved_ambiguity_handler()
+        return ()
+    else:
+        return ()
+
+
+def _handle_unresolved_pex_entrypoint(
+    address: Address,
+    entry_point: str,
+    ambiguous_owners,
+    unowned_dependency_behavior: UnownedDependencyUsage,
+) -> None:
+    """Raise an error if we could not disambiguate an entrypoint for the PEX."""
+    msg = softwrap(
+        f"""
+        Pants cannot resolve the entrypoint for the target {address}.
+        The entrypoint {entry_point} might refer to the following:
+
+        {bullet_list(o.spec for o in ambiguous_owners)}
+        """
+    )
+    if unowned_dependency_behavior is UnownedDependencyUsage.DoNothing:
+        pass
+    elif unowned_dependency_behavior is UnownedDependencyUsage.LogWarning:
+        logger.warning(msg)
+    else:
+        raise UnownedDependencyError(msg)
 
 
 # -----------------------------------------------------------------------------------------------
@@ -332,7 +402,7 @@ async def resolve_python_distribution_entry_points(
         entry_point_str for is_target, _, _, entry_point_str in classified_entry_points if is_target
     ]
 
-    # Intermediate step, as Get(Targets) returns a deduplicated set.. which breaks in case of
+    # Intermediate step, as Get(Targets) returns a deduplicated set which breaks in case of
     # multiple input refs that maps to the same target.
     target_addresses = await Get(
         Addresses,
@@ -356,7 +426,7 @@ async def resolve_python_distribution_entry_points(
                     target type {target.alias}.
 
                     Alternatively, you can use a module like "project.app:main".
-                    See {doc_url('python-distributions')}.
+                    See {doc_url('docs/python/overview/building-distributions')}.
                     """
                 )
             )
@@ -471,24 +541,11 @@ async def infer_python_distribution_dependencies(
     )
     module_owners: OrderedSet[Address] = OrderedSet()
     for (category, name, entry_point), owners in zip(all_module_entry_points, all_module_owners):
-        field_str = repr({category: {name: entry_point.spec}})
-        explicitly_provided_deps.maybe_warn_of_ambiguous_dependency_inference(
-            owners.ambiguous,
-            address,
-            import_reference="module",
-            context=softwrap(
-                f"""
-                The python_distribution target {address} has the field
-                `entry_points={field_str}`, which maps to the Python module
-                `{entry_point.module}`
-                """
-            ),
+        module_owners.update(
+            get_python_distribution_entry_point_unambiguous_module_owners(
+                address, category, name, entry_point, explicitly_provided_deps, owners
+            )
         )
-        maybe_disambiguated = explicitly_provided_deps.disambiguated(owners.ambiguous)
-        unambiguous_owners = owners.unambiguous or (
-            (maybe_disambiguated,) if maybe_disambiguated else ()
-        )
-        module_owners.update(unambiguous_owners)
 
     return InferredDependencies(
         Addresses(module_owners)

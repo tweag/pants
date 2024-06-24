@@ -31,7 +31,7 @@ from pants.engine.unions import UnionMembership, union
 from pants.option.option_types import StrListOption
 from pants.util.dirutil import safe_rmtree
 from pants.util.frozendict import FrozenDict
-from pants.util.meta import frozen_after_init
+from pants.util.strutil import softwrap
 
 
 class ExportError(Exception):
@@ -49,8 +49,7 @@ class ExportRequest:
     targets: Sequence[Target]
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class PostProcessingCommand:
     """A command to run as a local process after an exported digest is materialized."""
 
@@ -67,12 +66,11 @@ class PostProcessingCommand:
         argv: Iterable[str],
         extra_env: Mapping[str, str] = FrozenDict(),
     ):
-        self.argv = tuple(argv)
-        self.extra_env = FrozenDict(extra_env)
+        object.__setattr__(self, "argv", tuple(argv))
+        object.__setattr__(self, "extra_env", FrozenDict(extra_env))
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class ExportResult:
     description: str
     # Materialize digests under this reldir.
@@ -94,11 +92,11 @@ class ExportResult:
         post_processing_cmds: Iterable[PostProcessingCommand] = tuple(),
         resolve: str | None = None,
     ):
-        self.description = description
-        self.reldir = reldir
-        self.digest = digest
-        self.post_processing_cmds = tuple(post_processing_cmds)
-        self.resolve = resolve
+        object.__setattr__(self, "description", description)
+        object.__setattr__(self, "reldir", reldir)
+        object.__setattr__(self, "digest", digest)
+        object.__setattr__(self, "post_processing_cmds", tuple(post_processing_cmds))
+        object.__setattr__(self, "resolve", resolve)
 
 
 class ExportResults(Collection[ExportResult]):
@@ -107,7 +105,17 @@ class ExportResults(Collection[ExportResult]):
 
 class ExportSubsystem(GoalSubsystem):
     name = "export"
-    help = "Export Pants data for use in other tools, such as IDEs."
+    help = softwrap(
+        """
+        Export Pants data for use in other tools, such as IDEs.
+
+        :::caution Exporting tools requires creating a custom lockfile for them
+
+        Follow [the instructions for creating tool lockfiles](../../docs/python/overview/lockfiles#lockfiles-for-tools)
+
+        :::
+        """
+    )
 
     # NB: Only options that are relevant across many/most backends and languages
     #  should be defined here.  Backend-specific options should be defined in that backend
@@ -173,20 +181,20 @@ async def export(
             resolves_exported.add(result.resolve)
         console.print_stdout(f"Wrote {result.description} to {result_dir}")
 
-    unexported_resolves = sorted((set(export_subsys.resolve) - resolves_exported))
+    unexported_resolves = sorted(set(export_subsys.resolve) - resolves_exported)
     if unexported_resolves:
         all_known_user_resolve_names = await MultiGet(
             Get(KnownUserResolveNames, KnownUserResolveNamesRequest, request())
             for request in union_membership.get(KnownUserResolveNamesRequest)
         )
         all_valid_resolve_names = sorted(
-            [
+            {
                 *itertools.chain.from_iterable(kurn.names for kurn in all_known_user_resolve_names),
                 *(
                     sentinel.resolve_name
                     for sentinel in union_membership.get(GenerateToolLockfileSentinel)
                 ),
-            ]
+            }
         )
         raise UnrecognizedResolveNamesError(
             unexported_resolves,

@@ -59,7 +59,7 @@ class GPGVerifier:
         Looks the import results for one which has an "ok" status. We can't use the number of keys
         imported because a re-import of a key results in 0 keys imported.
         """
-        has_ok = any(("ok" in r for r in import_results.results))
+        has_ok = any("ok" in r for r in import_results.results)
         return has_ok
 
 
@@ -189,7 +189,7 @@ def fetch_platforms_for_version(
 ) -> Optional[List[ExternalToolVersion]]:
     """Fetch platform binary information for a particular Terraform version."""
     logging.info(
-        f"processiong version {version_slug} with {len(version_links.binary_links)} binaries"
+        f"processing version {version_slug} with {len(version_links.binary_links)} binaries"
     )
 
     if is_prerelease(version_slug):
@@ -251,7 +251,7 @@ def fetch_versions(
 
 if __name__ == "__main__":
     versions_url = "https://releases.hashicorp.com/terraform/"
-    number_of_supported_versions = 32
+    number_of_supported_versions = 43
 
     keydata = requests.get("https://keybase.io/hashicorp/pgp_keys.asc").content
     verifier = GPGVerifier(keydata)

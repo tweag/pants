@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import os
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
+from pants.backend.go.dependency_inference import GoModuleImportPathsMapping
 from pants.backend.go.subsystems.gotest import GoTestSubsystem
+from pants.backend.go.target_type_rules import GoImportPathMappingRequest
 from pants.backend.go.target_types import (
     GoPackageSourcesField,
     GoTestExtraEnvVarsField,
@@ -23,7 +27,10 @@ from pants.backend.go.util_rules.build_pkg import (
     FallibleBuildGoPackageRequest,
     FallibleBuiltGoPackage,
 )
-from pants.backend.go.util_rules.build_pkg_target import BuildGoPackageTargetRequest
+from pants.backend.go.util_rules.build_pkg_target import (
+    BuildGoPackageRequestForStdlibRequest,
+    BuildGoPackageTargetRequest,
+)
 from pants.backend.go.util_rules.coverage import (
     GenerateCoverageSetupCodeRequest,
     GenerateCoverageSetupCodeResult,
@@ -39,21 +46,32 @@ from pants.backend.go.util_rules.first_party_pkg import (
     FirstPartyPkgDigest,
     FirstPartyPkgDigestRequest,
 )
+from pants.backend.go.util_rules.go_mod import OwningGoMod, OwningGoModRequest
 from pants.backend.go.util_rules.goroot import GoRoot
-from pants.backend.go.util_rules.import_analysis import ImportConfig, ImportConfigRequest
+from pants.backend.go.util_rules.import_analysis import GoStdLibPackages, GoStdLibPackagesRequest
 from pants.backend.go.util_rules.link import LinkedGoBinary, LinkGoBinaryRequest
+from pants.backend.go.util_rules.pkg_analyzer import PackageAnalyzerSetup
 from pants.backend.go.util_rules.tests_analysis import GeneratedTestMain, GenerateTestMainRequest
+from pants.build_graph.address import Address
 from pants.core.goals.test import TestExtraEnv, TestFieldSet, TestRequest, TestResult, TestSubsystem
 from pants.core.target_types import FileSourceField
 from pants.core.util_rules.source_files import SourceFiles, SourceFilesRequest
 from pants.engine.env_vars import EnvironmentVars, EnvironmentVarsRequest
 from pants.engine.fs import EMPTY_FILE_DIGEST, AddPrefix, Digest, MergeDigests
 from pants.engine.internals.native_engine import EMPTY_DIGEST, Snapshot
-from pants.engine.process import FallibleProcessResult, Process, ProcessCacheScope
+from pants.engine.process import (
+    Process,
+    ProcessCacheScope,
+    ProcessResult,
+    ProcessResultWithRetries,
+    ProcessWithRetries,
+)
 from pants.engine.rules import Get, MultiGet, collect_rules, rule
 from pants.engine.target import Dependencies, DependenciesRequest, SourcesField, Target, Targets
 from pants.util.logging import LogLevel
 from pants.util.ordered_set import FrozenOrderedSet
+
+logger = logging.getLogger(__name__)
 
 # Known options to Go test binaries. Only these options will be transformed by `transform_test_args`.
 # The bool value represents whether the option is expected to take a value or not.
@@ -82,6 +100,7 @@ TEST_FLAGS = {
     "run": True,
     "short": False,
     "shuffle": True,
+    "skip": True,
     "timeout": True,
     "trace": True,
     "v": False,
@@ -197,13 +216,17 @@ def _lift_build_requests_with_coverage(
     result: list[BuildGoPackageRequest] = []
 
     queue: deque[BuildGoPackageRequest] = deque()
+    seen: set[BuildGoPackageRequest] = set()
     queue.extend(roots)
+    seen.update(roots)
 
     while queue:
         build_request = queue.popleft()
         if build_request.with_coverage:
             result.append(build_request)
-        queue.extend(build_request.direct_dependencies)
+        unseen = [dd for dd in build_request.direct_dependencies if dd not in seen]
+        queue.extend(unseen)
+        seen.update(unseen)
 
     return result
 
@@ -211,9 +234,12 @@ def _lift_build_requests_with_coverage(
 @rule(desc="Prepare Go test binary", level=LogLevel.DEBUG)
 async def prepare_go_test_binary(
     request: PrepareGoTestBinaryRequest,
+    analyzer: PackageAnalyzerSetup,
 ) -> FalliblePrepareGoTestBinaryResult:
-    build_opts = await Get(
-        GoBuildOptions, GoBuildOptionsFromTargetRequest(request.field_set.address)
+    go_mod_addr = await Get(OwningGoMod, OwningGoModRequest(request.field_set.address))
+    package_mapping, build_opts = await MultiGet(
+        Get(GoModuleImportPathsMapping, GoImportPathMappingRequest(go_mod_addr.address)),
+        Get(GoBuildOptions, GoBuildOptionsFromTargetRequest(request.field_set.address)),
     )
 
     maybe_pkg_analysis, maybe_pkg_digest, dependencies = await MultiGet(
@@ -265,12 +291,10 @@ async def prepare_go_test_binary(
         GenerateTestMainRequest(
             digest=pkg_digest.digest,
             test_paths=FrozenOrderedSet(
-                os.path.join(".", pkg_analysis.dir_path, name)
-                for name in pkg_analysis.test_go_files
+                os.path.join(pkg_analysis.dir_path, name) for name in pkg_analysis.test_go_files
             ),
             xtest_paths=FrozenOrderedSet(
-                os.path.join(".", pkg_analysis.dir_path, name)
-                for name in pkg_analysis.xtest_go_files
+                os.path.join(pkg_analysis.dir_path, name) for name in pkg_analysis.xtest_go_files
             ),
             import_path=import_path,
             register_cover=with_coverage,
@@ -289,6 +313,94 @@ async def prepare_go_test_binary(
             stderr="",
             exit_code=0,
         )
+
+    testmain_analysis_input_digest = await Get(
+        Digest, MergeDigests([testmain.digest, analyzer.digest])
+    )
+    testmain_analysis = await Get(
+        ProcessResult,
+        Process(
+            (analyzer.path, "."),
+            input_digest=testmain_analysis_input_digest,
+            description=f"Determine metadata for testmain for {request.field_set.address}",
+            level=LogLevel.DEBUG,
+            env={
+                "CGO_ENABLED": "1" if build_opts.cgo_enabled else "0",
+            },
+        ),
+    )
+    testmain_analysis_json = json.loads(testmain_analysis.stdout.decode())
+
+    stdlib_packages = await Get(
+        GoStdLibPackages,
+        GoStdLibPackagesRequest(
+            with_race_detector=build_opts.with_race_detector,
+            cgo_enabled=build_opts.cgo_enabled,
+        ),
+    )
+
+    inferred_dependencies: set[Address] = set()
+    stdlib_build_request_gets = []
+    for dep_import_path in testmain_analysis_json.get("Imports", []):
+        if dep_import_path == import_path:
+            continue  # test pkg dep added manually later
+
+        if dep_import_path in stdlib_packages:
+            stdlib_build_request_gets.append(
+                Get(
+                    FallibleBuildGoPackageRequest,
+                    BuildGoPackageRequestForStdlibRequest(
+                        import_path=dep_import_path,
+                        build_opts=build_opts,
+                    ),
+                )
+            )
+            continue
+
+        candidate_packages = package_mapping.mapping.get(dep_import_path)
+        if candidate_packages:
+            if candidate_packages.infer_all:
+                inferred_dependencies.update(candidate_packages.addresses)
+            else:
+                if len(candidate_packages.addresses) > 1:
+                    # TODO(#12761): Use ExplicitlyProvidedDependencies for disambiguation.
+                    logger.warning(
+                        f"Ambiguous mapping for import path {dep_import_path} on packages at addresses: {candidate_packages}"
+                    )
+                elif len(candidate_packages.addresses) == 1:
+                    inferred_dependencies.add(candidate_packages.addresses[0])
+                else:
+                    logger.debug(
+                        f"Unable to infer dependency for import path '{dep_import_path}' "
+                        f"in go_package at address '{request.field_set.address}'."
+                    )
+        else:
+            logger.debug(
+                f"Unable to infer dependency for import path '{dep_import_path}' "
+                f"in go_package at address '{request.field_set.address}'."
+            )
+
+    fallible_testmain_import_build_requests = await MultiGet(
+        Get(
+            FallibleBuildGoPackageRequest,
+            BuildGoPackageTargetRequest(
+                address=address,
+                build_opts=build_opts,
+            ),
+        )
+        for address in sorted(inferred_dependencies)
+    )
+
+    testmain_import_build_requests: list[BuildGoPackageRequest] = []
+    for build_request in fallible_testmain_import_build_requests:
+        if build_request.request is None:
+            return compilation_failure(build_request.exit_code, None, build_request.stderr)
+        testmain_import_build_requests.append(build_request.request)
+
+    stdlib_build_requests = await MultiGet(stdlib_build_request_gets)
+    for build_request in stdlib_build_requests:
+        assert build_request.request is not None
+        testmain_import_build_requests.append(build_request.request)
 
     # Construct the build request for the package under test.
     maybe_test_pkg_build_request = await Get(
@@ -309,7 +421,7 @@ async def prepare_go_test_binary(
 
     # Determine the direct dependencies of the generated main package. The test package itself is always a
     # dependency. Add the xtests package as well if any xtests exist.
-    main_direct_deps = [test_pkg_build_request]
+    main_direct_deps = [test_pkg_build_request, *testmain_import_build_requests]
     if testmain.has_xtests:
         # Build a synthetic package for xtests where the import path is the same as the package under test
         # but with "_test" appended.
@@ -390,20 +502,14 @@ async def prepare_go_test_binary(
     built_main_pkg = maybe_built_main_pkg.output
 
     main_pkg_a_file_path = built_main_pkg.import_paths_to_pkg_a_files["main"]
-    import_config = await Get(
-        ImportConfig,
-        ImportConfigRequest(built_main_pkg.import_paths_to_pkg_a_files, build_opts=build_opts),
-    )
-    linker_input_digest = await Get(
-        Digest, MergeDigests([built_main_pkg.digest, import_config.digest])
-    )
+
     binary = await Get(
         LinkedGoBinary,
         LinkGoBinaryRequest(
-            input_digest=linker_input_digest,
+            input_digest=built_main_pkg.digest,
             archives=(main_pkg_a_file_path,),
             build_opts=build_opts,
-            import_config_path=import_config.CONFIG_PATH,
+            import_paths_to_pkg_a_files=built_main_pkg.import_paths_to_pkg_a_files,
             output_filename="./test_runner",  # TODO: Name test binary the way that `go` does?
             description=f"Link Go test binary for {request.field_set.address}",
         ),
@@ -478,8 +584,8 @@ async def run_go_tests(
     if fallible_test_binary.exit_code != 0:
         return TestResult(
             exit_code=fallible_test_binary.exit_code,
-            stdout=fallible_test_binary.stdout,
-            stderr=fallible_test_binary.stderr,
+            stdout_bytes=fallible_test_binary.stdout.encode(),
+            stderr_bytes=fallible_test_binary.stderr.encode(),
             stdout_digest=EMPTY_FILE_DIGEST,
             stderr_digest=EMPTY_FILE_DIGEST,
             addresses=(field_set.address,),
@@ -570,28 +676,29 @@ async def run_go_tests(
         maybe_profile_args.append("-test.trace=trace.out")
         output_files.append("trace.out")
 
-    result = await Get(
-        FallibleProcessResult,
-        Process(
-            argv=(
-                test_binary.test_binary_path,
-                *test_flags,
-                *maybe_profile_args,
-            ),
-            env=extra_env,
-            input_digest=test_input_digest,
-            description=f"Run Go tests: {field_set.address}",
-            cache_scope=cache_scope,
-            working_directory=working_dir,
-            output_files=output_files,
-            level=LogLevel.DEBUG,
+    go_test_process = Process(
+        argv=(
+            test_binary.test_binary_path,
+            *test_flags,
+            *maybe_profile_args,
         ),
+        env=extra_env,
+        input_digest=test_input_digest,
+        description=f"Run Go tests: {field_set.address}",
+        cache_scope=cache_scope,
+        working_directory=working_dir,
+        output_files=output_files,
+        level=LogLevel.DEBUG,
+    )
+    results = await Get(
+        ProcessResultWithRetries,
+        ProcessWithRetries(go_test_process, test_subsystem.attempts_default),
     )
 
     coverage_data: GoCoverageData | None = None
     if test_subsystem.use_coverage:
         coverage_data = GoCoverageData(
-            coverage_digest=result.output_digest,
+            coverage_digest=results.last.output_digest,
             import_path=test_binary.import_path,
             sources_digest=test_binary.pkg_digest.digest,
             sources_dir_path=test_binary.pkg_analysis.dir_path,
@@ -601,7 +708,7 @@ async def run_go_tests(
     output_files = [x for x in output_files if x != "cover.out"]
     extra_output: Snapshot | None = None
     if output_files or output_test_binary:
-        output_digest = result.output_digest
+        output_digest = results.last.output_digest
         if output_test_binary:
             output_digest = await Get(
                 Digest, MergeDigests([output_digest, test_binary.test_binary_digest])
@@ -609,7 +716,7 @@ async def run_go_tests(
         extra_output = await Get(Snapshot, Digest, output_digest)
 
     return TestResult.from_fallible_process_result(
-        process_result=result,
+        process_results=results.results,
         address=field_set.address,
         output_setting=test_subsystem.output,
         coverage_data=coverage_data,

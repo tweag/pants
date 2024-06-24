@@ -3,10 +3,21 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import re
 import shlex
 import textwrap
-from typing import Iterable
+from collections import abc
+from logging import Logger
+from typing import Any, Callable, Iterable, Mapping, TypeVar
+
+import colors
+from typing_extensions import ParamSpec
+
+from pants.engine.internals.native_engine import Digest
+from pants.util.ordered_set import FrozenOrderedSet, OrderedSet
 
 
 def ensure_binary(text_or_binary: bytes | str) -> bytes:
@@ -61,33 +72,6 @@ def safe_shlex_join(arg_list: Iterable[str]) -> str:
     return " ".join(shell_quote(arg) for arg in arg_list)
 
 
-def create_path_env_var(
-    new_entries: Iterable[str],
-    env: dict[str, str] | None = None,
-    env_var: str = "PATH",
-    delimiter: str = ":",
-    prepend: bool = False,
-):
-    """Join path entries, combining with an environment variable if specified."""
-    if env is None:
-        env = {}
-
-    prev_path = env.get(env_var, None)
-    if prev_path is None:
-        path_dirs: list[str] = []
-    else:
-        path_dirs = list(prev_path.split(delimiter))
-
-    new_entries_list = list(new_entries)
-
-    if prepend:
-        path_dirs = new_entries_list + path_dirs
-    else:
-        path_dirs += new_entries_list
-
-    return delimiter.join(path_dirs)
-
-
 def pluralize(count: int, item_type: str, include_count: bool = True) -> str:
     """Pluralizes the item_type if the count does not equal one.
 
@@ -113,6 +97,18 @@ def pluralize(count: int, item_type: str, include_count: bool = True) -> str:
     else:
         text = f"{count} {pluralized_item}"
         return text
+
+
+def comma_separated_list(items: Iterable[str]) -> str:
+    items = list(items)
+    if len(items) == 0:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    # For 3+ items, employ the oxford comma.
+    return f"{', '.join(items[0:-1])}, and {items[-1]}"
 
 
 def strip_prefix(string: str, prefix: str) -> str:
@@ -144,6 +140,30 @@ def strip_v2_chroot_path(v: bytes | str) -> str:
     if isinstance(v, bytes):
         v = v.decode()
     return re.sub(r"/.*/pants-sandbox-[a-zA-Z0-9]+/", "", v)
+
+
+@dataclasses.dataclass(frozen=True)
+class Simplifier:
+    """Helper for options for conditionally simplifying a string."""
+
+    # it's only rarely useful to show a chroot path to a user, hence they're stripped by default
+    strip_chroot_path: bool = True
+    """remove all instances of the chroot tmpdir path"""
+    strip_formatting: bool = False
+    """remove ANSI formatting commands (colors, bold, etc)"""
+
+    def simplify(self, v: bytes | str) -> str:
+        chroot = (
+            strip_v2_chroot_path(v)
+            if self.strip_chroot_path
+            else v.decode()
+            if isinstance(v, bytes)
+            else v
+        )
+        formatting = colors.strip_color(chroot) if self.strip_formatting else chroot
+        assert isinstance(formatting, str)
+
+        return formatting
 
 
 def hard_wrap(s: str, *, indent: int = 0, width: int = 96) -> list[str]:
@@ -239,10 +259,13 @@ def softwrap(text: str) -> str:
             (If your indented line needs to be continued due to it being longer than the suggested
             width, use trailing backlashes to line-continue the line. Because we squash multiple
             spaces, this will "just work".)
+
+    To keep the numbered or bullet lists indented without converting to a code block,
+    make sure to use 2 spaces (and not 4).
     """
     if not text:
         return text
-    # If callers didn't use a leading "\" thats OK.
+    # If callers didn't use a leading "\" that's OK.
     if text[0] == "\n":
         text = text[1:]
 
@@ -290,3 +313,95 @@ def fmt_memory_size(value: int, *, units: Iterable[str] = _MEMORY_UNITS) -> str:
         unit_idx += 1
 
     return f"{int(amount)}{units[unit_idx]}"
+
+
+def strval(val: str | Callable[[], str]) -> str:
+    return val if isinstance(val, str) else val()
+
+
+def help_text(val: str | Callable[[], str]) -> str | Callable[[], str]:
+    """Convenience method for defining an optionally lazy-evaluated softwrapped help string.
+
+    This exists because `mypy` does not respect the type hints defined on base `Field` and `Target`
+    classes.
+    """
+    # This can go away when https://github.com/python/mypy/issues/14702 is fixed
+    if isinstance(val, str):
+        return softwrap(val)
+    else:
+        return lambda: softwrap(val())  # type: ignore[operator]
+
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def docstring(doc: str | Callable[[], str]) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Use this decorator to provide a dynamic doc-string to a function."""
+
+    def wrapper(func: Callable[P, R]) -> Callable[P, R]:
+        func.__doc__ = strval(doc)
+        return func
+
+    return wrapper
+
+
+class _JsonEncoder(json.JSONEncoder):
+    """Allow us to serialize everything, with a fallback on `str()` in case of any esoteric
+    types."""
+
+    def default(self, o):
+        """Return a serializable object for o."""
+        if isinstance(o, abc.Mapping):
+            return dict(o)
+        if isinstance(o, (abc.Sequence, OrderedSet, FrozenOrderedSet)):
+            return list(o)
+
+        # NB: A quick way to embed the type in the hash so that two objects with the same data but
+        # different types produce different hashes.
+        classname = o.__class__.__name__
+        if dataclasses.is_dataclass(o):
+            return {"__class__.__name__": classname, **dataclasses.asdict(o)}
+        if isinstance(o, (Digest,)):
+            return {"__class__.__name__": classname, "fingerprint": o.fingerprint}
+        return super().default(o)
+
+
+def stable_hash(value: Any, *, name: str = "sha256") -> str:
+    """Attempts to return a stable hash of the value stable across processes.
+
+    "Stable" here means that if `value` is equivalent in multiple invocations (across multiple
+    processes), it should produce the same hash. To that end, what values are accepted are limited
+    in scope.
+    """
+    return hashlib.new(
+        name,
+        json.dumps(
+            value, indent=None, separators=(",", ":"), sort_keys=True, cls=_JsonEncoder
+        ).encode("utf-8"),
+    ).hexdigest()
+
+
+# NB: If an OS string is not valid UTF-8, Python encodes the non-decodable bytes
+#  as lone surrogates (see https://peps.python.org/pep-0383/).
+#  However when we pass these to Rust, we will fail to decode as strict UTF-8.
+#  So we perform a lossy re-encoding to prevent this.
+def strict_utf8(s: str) -> str:
+    return s.encode("utf-8", "replace").decode("utf-8")
+
+
+def get_strict_env(env: Mapping[str, str], logger: Logger) -> Mapping[str, str]:
+    strict_env = {}
+    for key, val in sorted(env.items()):
+        strict_key = strict_utf8(key)
+        strict_val = strict_utf8(val)
+        if strict_key == key:
+            if strict_val == val:
+                strict_env[strict_key] = strict_val
+            else:
+                logger.warning(f"Environment variable with non-UTF-8 value ignored: {key}")
+        else:
+            # We can only log strict_key, because logging will choke on non-UTF-8.
+            # But the reader will know what we mean.
+            logger.warning(f"Environment variable with non-UTF-8 name ignored: {strict_key}")
+    return strict_env

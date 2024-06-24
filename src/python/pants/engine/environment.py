@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pants.base.deprecated import warn_or_error
 from pants.engine.engine_aware import EngineAwareParameter
-from pants.engine.env_vars import CompleteEnvironmentVars, EnvironmentVars, EnvironmentVarsRequest
 
+# Reserved sentinel value directing Pants to find applicable local environment.
 LOCAL_ENVIRONMENT_MATCHER = "__local__"
+
+# Reserved sentinel value directing Pants to find applicable workspace environment.
+LOCAL_WORKSPACE_ENVIRONMENT_MATCHER = "__local_workspace__"
 
 
 @dataclass(frozen=True)
@@ -34,28 +36,9 @@ class ChosenLocalEnvironmentName:
     val: EnvironmentName
 
 
-def __getattr__(name):
-    if name == "EnvironmentName":
-        return EnvironmentName
-    if name == "CompleteEnvironment":
-        warn_or_error(
-            "2.17.0.dev0",
-            "`pants.engine.environment.CompleteEnvironment`",
-            "Use `pants.engine.env_vars.CompleteEnvironmentVars`.",
-        )
-        return CompleteEnvironmentVars
-    if name == "EnvironmentRequest":
-        warn_or_error(
-            "2.17.0.dev0",
-            "`pants.engine.environment.EnvironmentRequest`",
-            "Use `pants.engine.env_vars.EnvironmentVarsRequest`.",
-        )
-        return EnvironmentVarsRequest
-    if name == "Environment":
-        warn_or_error(
-            "2.17.0.dev0",
-            "`pants.engine.environment.Environment`",
-            "Use `pants.engine.env_vars.EnvironmentVars`.",
-        )
-        return EnvironmentVars
-    raise AttributeError(name)
+@dataclass(frozen=True)
+class ChosenLocalWorkspaceEnvironmentName:
+    """Which environment name from `[environments-preview].names` that __local_workspace__ resolves
+    to."""
+
+    val: EnvironmentName

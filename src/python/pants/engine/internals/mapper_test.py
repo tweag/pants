@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 from textwrap import dedent
 
 import pytest
@@ -12,6 +13,7 @@ from pants.base.exceptions import MappingError
 from pants.build_graph.address import Address
 from pants.build_graph.build_file_aliases import BuildFileAliases
 from pants.core.target_types import GenericTarget
+from pants.engine.env_vars import EnvironmentVars
 from pants.engine.internals.defaults import BuildFileDefaults, BuildFileDefaultsParserState
 from pants.engine.internals.mapper import (
     AddressFamily,
@@ -20,12 +22,14 @@ from pants.engine.internals.mapper import (
     DuplicateNameError,
     SpecsFilter,
 )
-from pants.engine.internals.parser import BuildFilePreludeSymbols, Parser, _unrecognized_symbol_func
-from pants.engine.internals.target_adaptor import TargetAdaptor
+from pants.engine.internals.parser import BuildFilePreludeSymbols, Parser, _UnrecognizedSymbol
+from pants.engine.internals.target_adaptor import TargetAdaptor as _TargetAdaptor
 from pants.engine.target import RegisteredTargetTypes, Tags, Target
 from pants.engine.unions import UnionMembership
 from pants.testutil.option_util import create_goal_subsystem
 from pants.util.frozendict import FrozenDict
+
+TargetAdaptor = functools.partial(_TargetAdaptor, __description_of_origin__="BUILD")
 
 
 def parse_address_map(build_file: str, *, ignore_unrecognized_symbols: bool = False) -> AddressMap:
@@ -41,7 +45,9 @@ def parse_address_map(build_file: str, *, ignore_unrecognized_symbols: bool = Fa
         path,
         build_file,
         parser,
-        BuildFilePreludeSymbols(FrozenDict()),
+        BuildFilePreludeSymbols(FrozenDict(), ()),
+        EnvironmentVars({}),
+        False,
         BuildFileDefaultsParserState.create(
             "", BuildFileDefaults({}), RegisteredTargetTypes({}), UnionMembership({})
         ),
@@ -89,7 +95,7 @@ def test_address_map_unrecognized_symbol() -> None:
     address_map = parse_address_map(build_file, ignore_unrecognized_symbols=True)
     assert {
         "one": TargetAdaptor(type_alias="thing", name="one"),
-        "bad": TargetAdaptor(type_alias="thing", name="bad", age=_unrecognized_symbol_func),
+        "bad": TargetAdaptor(type_alias="thing", name="bad", age=_UnrecognizedSymbol("fake")),
         "two": TargetAdaptor(type_alias="thing", name="two"),
         "three": TargetAdaptor(
             type_alias="thing",

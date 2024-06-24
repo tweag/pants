@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Union
 
 import pytest
 
@@ -38,6 +38,8 @@ from pants.engine.fs import (
     MergeDigests,
     PathGlobs,
     PathGlobsAndRoot,
+    PathMetadataRequest,
+    PathMetadataResult,
     RemovePrefix,
     Snapshot,
     SnapshotDiff,
@@ -45,6 +47,7 @@ from pants.engine.fs import (
     Workspace,
 )
 from pants.engine.goal import Goal, GoalSubsystem
+from pants.engine.internals.native_engine import PathMetadata, PathMetadataKind
 from pants.engine.internals.scheduler import ExecutionError
 from pants.engine.rules import Get, goal_rule, rule
 from pants.testutil.rule_runner import QueryRule, RuleRunner
@@ -64,6 +67,7 @@ def rule_runner() -> RuleRunner:
             QueryRule(Snapshot, [CreateDigest]),
             QueryRule(Snapshot, [DigestSubset]),
             QueryRule(Snapshot, [PathGlobs]),
+            QueryRule(PathMetadataResult, [PathMetadataRequest]),
         ],
         isolated_local_store=True,
     )
@@ -140,6 +144,18 @@ def try_with_backoff(assertion_fn: Callable[[], bool], count: int = 4) -> bool:
         if assertion_fn():
             return True
     return False
+
+
+# -----------------------------------------------------------------------------------------------
+# `FileContent`
+# -----------------------------------------------------------------------------------------------
+
+
+def test_file_content_non_bytes():
+    with pytest.raises(TypeError) as exc:
+        FileContent(path="4.txt", content="four")
+
+    assert str(exc.value) == "Expected 'content' to be bytes, but got str"
 
 
 # -----------------------------------------------------------------------------------------------
@@ -1185,6 +1201,66 @@ def test_write_digest_workspace(rule_runner: RuleRunner) -> None:
     assert path2.read_text() == "goodbye"
 
 
+def test_write_digest_workspace_clear_paths(rule_runner: RuleRunner) -> None:
+    workspace = Workspace(rule_runner.scheduler, _enforce_effects=False)
+    digest_a = rule_runner.request(
+        Digest,
+        [CreateDigest([FileContent("newdir/a.txt", b"hello")])],
+    )
+    digest_b = rule_runner.request(
+        Digest,
+        [CreateDigest([FileContent("newdir/b.txt", b"goodbye")])],
+    )
+    digest_c = rule_runner.request(
+        Digest,
+        [CreateDigest([FileContent("newdir/c.txt", b"hello again")])],
+    )
+    digest_c_root = rule_runner.request(
+        Digest, [CreateDigest([FileContent("c.txt", b"hello again")])]
+    )
+    digest_d = rule_runner.request(
+        Digest, [CreateDigest([SymlinkEntry("newdir/d.txt", "newdir/a.txt")])]
+    )
+    all_paths = {name: Path(rule_runner.build_root, f"newdir/{name}.txt") for name in "abcd"}
+
+    def check(expected_names: set[str]) -> None:
+        for name, path in all_paths.items():
+            expected = name in expected_names
+            assert path.exists() == expected
+
+    workspace.write_digest(digest_a, clear_paths=())
+    workspace.write_digest(digest_b, clear_paths=())
+    check({"a", "b"})
+
+    # clear a file
+    workspace.write_digest(digest_d, clear_paths=("newdir/b.txt",))
+    check({"a", "d"})
+
+    # clear a symlink (doesn't remove target file)
+    workspace.write_digest(digest_b, clear_paths=("newdir/d.txt",))
+    check({"a", "b"})
+
+    # clear a directory
+    workspace.write_digest(digest_c, clear_paths=("newdir",))
+    check({"c"})
+
+    # path prefix, and clearing the 'current' directory
+    workspace.write_digest(digest_c_root, path_prefix="newdir", clear_paths=("",))
+    check({"c"})
+
+    # clear multiple paths
+    workspace.write_digest(digest_b, clear_paths=())
+    check({"b", "c"})
+    workspace.write_digest(digest_a, clear_paths=("newdir/b.txt", "newdir/c.txt"))
+    check({"a"})
+
+    # clearing non-existent paths is fine
+    workspace.write_digest(
+        digest_b, clear_paths=("not-here", "newdir/not-here", "not-here/also-not-here")
+    )
+    check({"a", "b"})
+
+
 @dataclass(frozen=True)
 class DigestRequest:
     create_digest: CreateDigest
@@ -1244,7 +1320,7 @@ def test_invalidated_after_rewrite(rule_runner: RuleRunner) -> None:
 
 
 def test_invalidated_after_parent_deletion(rule_runner: RuleRunner) -> None:
-    """Test that FileContent is invalidated after deleting parent directory."""
+    """Test that FileContent is invalidated after deleting the parent directory."""
     setup_fs_test_tar(rule_runner)
 
     def read_file() -> Optional[str]:
@@ -1339,49 +1415,20 @@ def test_digest_is_not_file_digest() -> None:
 
 
 def test_snapshot_properties() -> None:
-    digest = Digest("691638f4d58abaa8cfdc9af2e00682f13f07f96ad1d177f146216a7341ca4982", 154)
-    snapshot = Snapshot._unsafe_create(digest, ["f.ext", "dir/f.ext"], ["dir"])
-    assert snapshot.digest == digest
+    snapshot = Snapshot.create_for_testing(["f.ext", "dir/f.ext"], ["dir"])
+    assert snapshot.digest is not None
     assert snapshot.files == ("dir/f.ext", "f.ext")
     assert snapshot.dirs == ("dir",)
 
 
-def test_snapshot_hash() -> None:
-    def assert_hash(
-        expected: int,
-        *,
-        digest_char: str = "a",
-        files: Optional[List[str]] = None,
-        dirs: Optional[List[str]] = None,
-    ) -> None:
-        digest = Digest(digest_char * 64, 1000)
-        snapshot = Snapshot._unsafe_create(digest, files or ["f.ext", "dir/f.ext"], dirs or ["dir"])
-        assert hash(snapshot) == expected
-
-    # The digest's fingerprint is used for the hash, so all other properties are irrelevant.
-    assert_hash(-6148914691236517206)
-    assert_hash(-6148914691236517206, files=["f.ext"])
-    assert_hash(-6148914691236517206, dirs=["foo"])
-    assert_hash(-6148914691236517206, dirs=["foo"])
-    assert_hash(-4919131752989213765, digest_char="b")
-
-
-def test_snapshot_equality() -> None:
-    # Only the digest is used for equality.
-    snapshot = Snapshot._unsafe_create(Digest("a" * 64, 1000), ["f.ext", "dir/f.ext"], ["dir"])
-    assert snapshot == Snapshot._unsafe_create(
-        Digest("a" * 64, 1000), ["f.ext", "dir/f.ext"], ["dir"]
-    )
-    assert snapshot == Snapshot._unsafe_create(
-        Digest("a" * 64, 1000), ["f.ext", "dir/f.ext"], ["foo"]
-    )
-    assert snapshot == Snapshot._unsafe_create(Digest("a" * 64, 1000), ["f.ext"], ["dir"])
-    assert snapshot != Snapshot._unsafe_create(Digest("a" * 64, 0), ["f.ext", "dir/f.ext"], ["dir"])
-    assert snapshot != Snapshot._unsafe_create(
-        Digest("b" * 64, 1000), ["f.ext", "dir/f.ext"], ["dir"]
-    )
-    with pytest.raises(TypeError):
-        snapshot < snapshot  # type: ignore[operator]
+def test_snapshot_hash_and_eq() -> None:
+    one = Snapshot.create_for_testing(["f.ext"], ["dir"])
+    two = Snapshot.create_for_testing(["f.ext"], ["dir"])
+    assert hash(one) == hash(two)
+    assert one == two
+    three = Snapshot.create_for_testing(["f.ext"], [])
+    assert hash(two) != hash(three)
+    assert two != three
 
 
 @pytest.mark.parametrize(
@@ -1459,3 +1506,71 @@ def test_snapshot_diff(
     assert diff.their_unique_files == expected_diff.our_unique_files
     assert diff.their_unique_dirs == expected_diff.our_unique_dirs
     assert diff.changed_files == expected_diff.changed_files
+
+
+def retry_failed_assertions(
+    callable: Callable[[], Any], n: int, sleep_duration: float = 0.05
+) -> None:
+    """Retry the callable if any assertions failed.
+
+    This is used to handle any failures resulting from an external system not fully processing
+    certain events as expected.
+    """
+    last_exception: BaseException | None = None
+
+    while n > 0:
+        try:
+            callable()
+            return
+        except AssertionError as e:
+            last_exception = e
+            n -= 1
+            time.sleep(sleep_duration)
+            sleep_duration *= 2
+
+    assert last_exception is not None
+    raise last_exception
+
+
+def test_path_metadata_request(rule_runner: RuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            "foo": b"xyzzy",
+            "sub-dir/bar": b"12345",
+        }
+    )
+    os.symlink("foo", os.path.join(rule_runner.build_root, "bar"))
+
+    def get_metadata(path: str) -> PathMetadata | None:
+        result = rule_runner.request(PathMetadataResult, [PathMetadataRequest(path)])
+        return result.metadata
+
+    m1 = get_metadata("foo")
+    assert m1 is not None
+    assert m1.path == "foo"
+    assert m1.kind == PathMetadataKind.FILE
+    assert m1.length == len(b"xyzzy")
+    assert m1.symlink_target is None
+
+    m2 = get_metadata("not-found")
+    assert m2 is None
+    (Path(rule_runner.build_root) / "not-found").write_bytes(b"is found")
+
+    def check_metadata_exists() -> None:
+        m3 = get_metadata("not-found")
+        assert m3 is not None
+
+    retry_failed_assertions(check_metadata_exists, 3)
+
+    m4 = get_metadata("bar")
+    assert m4 is not None
+    assert m4.path == "bar"
+    assert m4.kind == PathMetadataKind.SYMLINK
+    assert m4.length == 3
+    assert m4.symlink_target == "foo"
+
+    m5 = get_metadata("sub-dir")
+    assert m5 is not None
+    assert m5.path == "sub-dir"
+    assert m5.kind == PathMetadataKind.DIRECTORY
+    assert m5.symlink_target is None

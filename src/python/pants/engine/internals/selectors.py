@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
+    Coroutine,
     Generator,
     Generic,
     Iterable,
@@ -19,12 +20,7 @@ from typing import (
     overload,
 )
 
-from pants.engine.internals.native_engine import (
-    PyGeneratorResponseBreak,
-    PyGeneratorResponseGet,
-    PyGeneratorResponseGetMulti,
-)
-from pants.util.meta import frozen_after_init
+from pants.engine.internals.native_engine import PyGeneratorResponseCall, PyGeneratorResponseGet
 from pants.util.strutil import softwrap
 
 _Output = TypeVar("_Output")
@@ -41,10 +37,10 @@ class GetParseError(ValueError):
             if isinstance(expr, ast.Call):
                 # Check if it's a top-level function call.
                 if hasattr(expr.func, "id"):
-                    return f"{expr.func.id}()"  # type: ignore[attr-defined]
+                    return f"{expr.func.id}()"
                 # Check if it's a method call.
                 if hasattr(expr.func, "attr") and hasattr(expr.func, "value"):
-                    return f"{expr.func.value.id}.{expr.func.attr}()"  # type: ignore[attr-defined]
+                    return f"{expr.func.value.id}.{expr.func.attr}()"
 
             # Fall back to the name of the ast node's class.
             return str(type(expr))
@@ -57,10 +53,13 @@ class GetParseError(ValueError):
         )
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class AwaitableConstraints:
+    # If this is a call-by-name, then we will already know the callable `@rule` that will be used.
+    rule_id: str | None
     output_type: type
+    # The number of explicit positional arguments passed to a call-by-name awaitable.
+    explicit_args_arity: int
     input_types: tuple[type, ...]
     is_effect: bool
 
@@ -77,6 +76,14 @@ class AwaitableConstraints:
 
     def __str__(self) -> str:
         return repr(self)
+
+
+class Call(PyGeneratorResponseCall):
+    def __await__(
+        self,
+    ) -> Generator[Any, None, Any]:
+        result = yield self
+        return result
 
 
 # TODO: Conditional needed until Python 3.8 allows the subscripted type to be used directly.
@@ -99,7 +106,7 @@ class Awaitable(Generic[_Output], _BasePyGeneratorResponseGet[_Output]):
         """Allow a Get to be `await`ed within an `async` method, returning a strongly-typed result.
 
         The `yield`ed value `self` is interpreted by the engine within
-        `native_engine_generator_send()`. This class will yield a single Get instance, which is
+        `generator_send()`. This class will yield a single Get instance, which is
         a subclass of `PyGeneratorResponseGet`.
 
         This is how this method is eventually called:
@@ -121,7 +128,7 @@ class Awaitable(Generic[_Output], _BasePyGeneratorResponseGet[_Output]):
 class Effect(Generic[_Output], Awaitable[_Output]):
     """Asynchronous generator API for types which are SideEffecting.
 
-    Unlike `Get`s, `Effect`s can cause side-effects (writing files to the workspace, publishing
+    Unlike `Get`s, `Effect`s can cause side effects (writing files to the workspace, publishing
     things, printing to the console), and so they may only be used in `@goal_rule`s.
 
     See Get for more information on supported syntaxes.
@@ -131,7 +138,10 @@ class Effect(Generic[_Output], Awaitable[_Output]):
 class Get(Generic[_Output], Awaitable[_Output]):
     """Asynchronous generator API for side-effect-free types.
 
-    A Get can be constructed in 3 ways:
+    A Get can be constructed in 4 ways:
+
+    + No arguments:
+        Get(<OutputType>)
 
     + Long form:
         Get(<OutputType>, <InputType>, input)
@@ -144,8 +154,8 @@ class Get(Generic[_Output], Awaitable[_Output]):
 
     The long form supports providing type information to the rule engine that it could not otherwise
     infer from the input variable [1]. Likewise, the short form must use inline construction of the
-    input in order to convey the input type to the engine. The dict form supports providing zero or
-    more inputs to the engine for the Get request.
+    input in order to convey the input type to the engine. The dict form supports providing >1
+    inputs to the engine for the Get request.
 
     [1] The engine needs to determine all rule and Get input and output types statically before
     executing any rules. Since Gets are declared inside function bodies, the only way to extract this
@@ -158,9 +168,9 @@ class Get(Generic[_Output], Awaitable[_Output]):
 
 @dataclass(frozen=True)
 class _MultiGet:
-    gets: tuple[Get, ...]
+    gets: tuple[Get | Coroutine, ...]
 
-    def __await__(self) -> Generator[tuple[Get, ...], None, tuple]:
+    def __await__(self) -> Generator[tuple[Get | Coroutine, ...], None, tuple]:
         result = yield self.gets
         return cast(Tuple, result)
 
@@ -181,143 +191,152 @@ _Out9 = TypeVar("_Out9")
 
 
 @overload
-async def MultiGet(__gets: Iterable[Get[_Output]]) -> tuple[_Output, ...]:  # noqa: F811
-    ...
-
-
-@overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Output],
-    __get1: Get[_Output],
-    __get2: Get[_Output],
-    __get3: Get[_Output],
-    __get4: Get[_Output],
-    __get5: Get[_Output],
-    __get6: Get[_Output],
-    __get7: Get[_Output],
-    __get8: Get[_Output],
-    __get9: Get[_Output],
-    __get10: Get[_Output],
-    *__gets: Get[_Output],
+async def MultiGet(
+    __gets: Iterable[Get[_Output] | Coroutine[Any, Any, _Output]]
 ) -> tuple[_Output, ...]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
-    __get4: Get[_Out4],
-    __get5: Get[_Out5],
-    __get6: Get[_Out6],
-    __get7: Get[_Out7],
-    __get8: Get[_Out8],
-    __get9: Get[_Out9],
+async def MultiGet(
+    __get0: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get1: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get2: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get3: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get4: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get5: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get6: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get7: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get8: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get9: Get[_Output] | Coroutine[Any, Any, _Output],
+    __get10: Get[_Output] | Coroutine[Any, Any, _Output],
+    *__gets: Get[_Output] | Coroutine[Any, Any, _Output],
+) -> tuple[_Output, ...]:
+    ...
+
+
+@overload
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
+    __get4: Get[_Out4] | Coroutine[Any, Any, _Out4],
+    __get5: Get[_Out5] | Coroutine[Any, Any, _Out5],
+    __get6: Get[_Out6] | Coroutine[Any, Any, _Out6],
+    __get7: Get[_Out7] | Coroutine[Any, Any, _Out7],
+    __get8: Get[_Out8] | Coroutine[Any, Any, _Out8],
+    __get9: Get[_Out9] | Coroutine[Any, Any, _Out9],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3, _Out4, _Out5, _Out6, _Out7, _Out8, _Out9]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
-    __get4: Get[_Out4],
-    __get5: Get[_Out5],
-    __get6: Get[_Out6],
-    __get7: Get[_Out7],
-    __get8: Get[_Out8],
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
+    __get4: Get[_Out4] | Coroutine[Any, Any, _Out4],
+    __get5: Get[_Out5] | Coroutine[Any, Any, _Out5],
+    __get6: Get[_Out6] | Coroutine[Any, Any, _Out6],
+    __get7: Get[_Out7] | Coroutine[Any, Any, _Out7],
+    __get8: Get[_Out8] | Coroutine[Any, Any, _Out8],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3, _Out4, _Out5, _Out6, _Out7, _Out8]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
-    __get4: Get[_Out4],
-    __get5: Get[_Out5],
-    __get6: Get[_Out6],
-    __get7: Get[_Out7],
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
+    __get4: Get[_Out4] | Coroutine[Any, Any, _Out4],
+    __get5: Get[_Out5] | Coroutine[Any, Any, _Out5],
+    __get6: Get[_Out6] | Coroutine[Any, Any, _Out6],
+    __get7: Get[_Out7] | Coroutine[Any, Any, _Out7],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3, _Out4, _Out5, _Out6, _Out7]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
-    __get4: Get[_Out4],
-    __get5: Get[_Out5],
-    __get6: Get[_Out6],
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
+    __get4: Get[_Out4] | Coroutine[Any, Any, _Out4],
+    __get5: Get[_Out5] | Coroutine[Any, Any, _Out5],
+    __get6: Get[_Out6] | Coroutine[Any, Any, _Out6],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3, _Out4, _Out5, _Out6]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
-    __get4: Get[_Out4],
-    __get5: Get[_Out5],
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
+    __get4: Get[_Out4] | Coroutine[Any, Any, _Out4],
+    __get5: Get[_Out5] | Coroutine[Any, Any, _Out5],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3, _Out4, _Out5]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
-    __get4: Get[_Out4],
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
+    __get4: Get[_Out4] | Coroutine[Any, Any, _Out4],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3, _Out4]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0],
-    __get1: Get[_Out1],
-    __get2: Get[_Out2],
-    __get3: Get[_Out3],
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
+    __get3: Get[_Out3] | Coroutine[Any, Any, _Out3],
 ) -> tuple[_Out0, _Out1, _Out2, _Out3]:
     ...
 
 
 @overload
-async def MultiGet(  # noqa: F811
-    __get0: Get[_Out0], __get1: Get[_Out1], __get2: Get[_Out2]
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+    __get2: Get[_Out2] | Coroutine[Any, Any, _Out2],
 ) -> tuple[_Out0, _Out1, _Out2]:
     ...
 
 
 @overload
-async def MultiGet(__get0: Get[_Out0], __get1: Get[_Out1]) -> tuple[_Out0, _Out1]:  # noqa: F811
+async def MultiGet(
+    __get0: Get[_Out0] | Coroutine[Any, Any, _Out0],
+    __get1: Get[_Out1] | Coroutine[Any, Any, _Out1],
+) -> tuple[_Out0, _Out1]:
     ...
 
 
-async def MultiGet(  # noqa: F811
-    __arg0: Iterable[Get[_Output]] | Get[_Out0],
-    __arg1: Get[_Out1] | None = None,
-    __arg2: Get[_Out2] | None = None,
-    __arg3: Get[_Out3] | None = None,
-    __arg4: Get[_Out4] | None = None,
-    __arg5: Get[_Out5] | None = None,
-    __arg6: Get[_Out6] | None = None,
-    __arg7: Get[_Out7] | None = None,
-    __arg8: Get[_Out8] | None = None,
-    __arg9: Get[_Out9] | None = None,
-    *__args: Get[_Output],
+async def MultiGet(
+    __arg0: Iterable[Get[_Output] | Coroutine[Any, Any, _Output]]
+    | Get[_Out0]
+    | Coroutine[Any, Any, _Out0],
+    __arg1: Get[_Out1] | Coroutine[Any, Any, _Out1] | None = None,
+    __arg2: Get[_Out2] | Coroutine[Any, Any, _Out2] | None = None,
+    __arg3: Get[_Out3] | Coroutine[Any, Any, _Out3] | None = None,
+    __arg4: Get[_Out4] | Coroutine[Any, Any, _Out4] | None = None,
+    __arg5: Get[_Out5] | Coroutine[Any, Any, _Out5] | None = None,
+    __arg6: Get[_Out6] | Coroutine[Any, Any, _Out6] | None = None,
+    __arg7: Get[_Out7] | Coroutine[Any, Any, _Out7] | None = None,
+    __arg8: Get[_Out8] | Coroutine[Any, Any, _Out8] | None = None,
+    __arg9: Get[_Out9] | Coroutine[Any, Any, _Out9] | None = None,
+    *__args: Get[_Output] | Coroutine[Any, Any, _Output],
 ) -> (
     tuple[_Output, ...]
     | tuple[_Out0, _Out1, _Out2, _Out3, _Out4, _Out5, _Out6, _Out7, _Out8, _Out9]
@@ -334,7 +353,7 @@ async def MultiGet(  # noqa: F811
     """Yield a tuple of Get instances all at once.
 
     The `yield`ed value `self.gets` is interpreted by the engine within
-    `native_engine_generator_send()`. This class will yield a tuple of Get instances,
+    `generator_send()`. This class will yield a tuple of Get instances,
     which is converted into `PyGeneratorResponse::GetMulti`.
 
     The engine will fulfill these Get instances in parallel, and return a tuple of _Output
@@ -357,16 +376,153 @@ async def MultiGet(  # noqa: F811
         return await _MultiGet(tuple(__arg0))
 
     if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and isinstance(__arg4, Get)
-        and isinstance(__arg5, Get)
-        and isinstance(__arg6, Get)
-        and isinstance(__arg7, Get)
-        and isinstance(__arg8, Get)
-        and isinstance(__arg9, Get)
+        isinstance(__arg0, (Get, Coroutine))
+        and __arg1 is None
+        and __arg2 is None
+        and __arg3 is None
+        and __arg4 is None
+        and __arg5 is None
+        and __arg6 is None
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0,))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and __arg2 is None
+        and __arg3 is None
+        and __arg4 is None
+        and __arg5 is None
+        and __arg6 is None
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and __arg3 is None
+        and __arg4 is None
+        and __arg5 is None
+        and __arg6 is None
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1, __arg2))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and __arg4 is None
+        and __arg5 is None
+        and __arg6 is None
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1, __arg2, __arg3))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and isinstance(__arg4, (Get, Coroutine))
+        and __arg5 is None
+        and __arg6 is None
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and isinstance(__arg4, (Get, Coroutine))
+        and isinstance(__arg5, (Get, Coroutine))
+        and __arg6 is None
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4, __arg5))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and isinstance(__arg4, (Get, Coroutine))
+        and isinstance(__arg5, (Get, Coroutine))
+        and isinstance(__arg6, (Get, Coroutine))
+        and __arg7 is None
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and isinstance(__arg4, (Get, Coroutine))
+        and isinstance(__arg5, (Get, Coroutine))
+        and isinstance(__arg6, (Get, Coroutine))
+        and isinstance(__arg7, (Get, Coroutine))
+        and __arg8 is None
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6, __arg7))
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and isinstance(__arg4, (Get, Coroutine))
+        and isinstance(__arg5, (Get, Coroutine))
+        and isinstance(__arg6, (Get, Coroutine))
+        and isinstance(__arg7, (Get, Coroutine))
+        and isinstance(__arg8, (Get, Coroutine))
+        and __arg9 is None
+        and not __args
+    ):
+        return await _MultiGet(
+            (__arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6, __arg7, __arg8)
+        )
+
+    if (
+        isinstance(__arg0, (Get, Coroutine))
+        and isinstance(__arg1, (Get, Coroutine))
+        and isinstance(__arg2, (Get, Coroutine))
+        and isinstance(__arg3, (Get, Coroutine))
+        and isinstance(__arg4, (Get, Coroutine))
+        and isinstance(__arg5, (Get, Coroutine))
+        and isinstance(__arg6, (Get, Coroutine))
+        and isinstance(__arg7, (Get, Coroutine))
+        and isinstance(__arg8, (Get, Coroutine))
+        and isinstance(__arg9, (Get, Coroutine))
         and all(isinstance(arg, Get) for arg in __args)
     ):
         return await _MultiGet(
@@ -385,143 +541,6 @@ async def MultiGet(  # noqa: F811
             )
         )
 
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and isinstance(__arg4, Get)
-        and isinstance(__arg5, Get)
-        and isinstance(__arg6, Get)
-        and isinstance(__arg7, Get)
-        and isinstance(__arg8, Get)
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet(
-            (__arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6, __arg7, __arg8)
-        )
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and isinstance(__arg4, Get)
-        and isinstance(__arg5, Get)
-        and isinstance(__arg6, Get)
-        and isinstance(__arg7, Get)
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6, __arg7))
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and isinstance(__arg4, Get)
-        and isinstance(__arg5, Get)
-        and isinstance(__arg6, Get)
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6))
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and isinstance(__arg4, Get)
-        and isinstance(__arg5, Get)
-        and __arg6 is None
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4, __arg5))
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and isinstance(__arg4, Get)
-        and __arg5 is None
-        and __arg6 is None
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1, __arg2, __arg3, __arg4))
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and isinstance(__arg3, Get)
-        and __arg4 is None
-        and __arg5 is None
-        and __arg6 is None
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1, __arg2, __arg3))
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and isinstance(__arg2, Get)
-        and __arg3 is None
-        and __arg4 is None
-        and __arg5 is None
-        and __arg6 is None
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1, __arg2))
-
-    if (
-        isinstance(__arg0, Get)
-        and isinstance(__arg1, Get)
-        and __arg2 is None
-        and __arg3 is None
-        and __arg4 is None
-        and __arg5 is None
-        and __arg6 is None
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0, __arg1))
-
-    if (
-        isinstance(__arg0, Get)
-        and __arg1 is None
-        and __arg2 is None
-        and __arg3 is None
-        and __arg4 is None
-        and __arg5 is None
-        and __arg6 is None
-        and __arg7 is None
-        and __arg8 is None
-        and __arg9 is None
-        and not __args
-    ):
-        return await _MultiGet((__arg0,))
-
     args = __arg0, __arg1, __arg2, __arg3, __arg4, __arg5, __arg6, __arg7, __arg8, __arg9, *__args
 
     def render_arg(arg: Any) -> str | None:
@@ -531,7 +550,7 @@ async def MultiGet(  # noqa: F811
             return repr(arg)
         return repr(arg)
 
-    likely_args_exlicitly_passed = tuple(
+    likely_args_explicitly_passed = tuple(
         reversed(
             [
                 render_arg(arg)
@@ -539,12 +558,12 @@ async def MultiGet(  # noqa: F811
             ]
         )
     )
-    if any(arg is None for arg in likely_args_exlicitly_passed):
+    if any(arg is None for arg in likely_args_explicitly_passed):
         raise ValueError(
             softwrap(
                 f"""
                 Unexpected MultiGet None arguments: {', '.join(
-                    map(str, likely_args_exlicitly_passed)
+                    map(str, likely_args_explicitly_passed)
                 )}
 
                 When constructing a MultiGet from individual Gets, all leading arguments must be
@@ -556,7 +575,7 @@ async def MultiGet(  # noqa: F811
     raise TypeError(
         softwrap(
             f"""
-            Unexpected MultiGet argument types: {', '.join(map(str, likely_args_exlicitly_passed))}
+            Unexpected MultiGet argument types: {', '.join(map(str, likely_args_explicitly_passed))}
 
             A MultiGet can be constructed in two ways:
               1. MultiGet(Iterable[Get[T]]) -> Tuple[T]
@@ -576,8 +595,11 @@ async def MultiGet(  # noqa: F811
     )
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+# Alias for `MultiGet` to new syntax name `concurrently`, while remaining backwards compatible.
+concurrently = MultiGet
+
+
+@dataclass(frozen=True)
 class Params:
     """A set of values with distinct types.
 
@@ -587,25 +609,4 @@ class Params:
     params: tuple[Any, ...]
 
     def __init__(self, *args: Any) -> None:
-        self.params = tuple(args)
-
-
-def native_engine_generator_send(
-    func, arg
-) -> PyGeneratorResponseGet | PyGeneratorResponseGetMulti | PyGeneratorResponseBreak:
-    try:
-        res = func.send(arg)
-        # It isn't necessary to differentiate between `Get` and `Effect` here, as the static
-        # analysis of `@rule`s has already validated usage.
-        if isinstance(res, (Get, Effect)):
-            return res
-        elif type(res) in (tuple, list):
-            return PyGeneratorResponseGetMulti(res)
-        else:
-            raise ValueError(f"internal engine error: unrecognized coroutine result {res}")
-    except StopIteration as e:
-        if not e.args:
-            raise
-        # This was a `return` from a coroutine, as opposed to a `StopIteration` raised
-        # by calling `next()` on an empty iterator.
-        return PyGeneratorResponseBreak(e.value)
+        object.__setattr__(self, "params", tuple(args))

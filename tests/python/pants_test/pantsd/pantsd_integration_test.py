@@ -347,6 +347,8 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
             time.sleep(10)
             ctx.checker.assert_running()
 
+    @unittest.skip("flaky: https://github.com/pantsbuild/pants/issues/18664")
+    @pytest.mark.no_error_if_skipped
     def test_pantsd_invalidation_file_tracking(self):
         test_dir = "testprojects/src/python/print_env"
         config = {"GLOBAL": {"pantsd_invalidation_globs": f'["{test_dir}/*"]'}}
@@ -354,8 +356,8 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
             ctx.runner(["help"])
             ctx.checker.assert_started()
 
-            # Let any fs events quiesce.
-            time.sleep(5)
+            # See comment in `test_pantsd_invalidation_pants_toml_file`.
+            time.sleep(15)
             ctx.checker.assert_running()
 
             def full_pants_log():
@@ -370,6 +372,8 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
 
             self.assertIn("saw filesystem changes covered by invalidation globs", full_pants_log())
 
+    @unittest.skip("flaky: https://github.com/pantsbuild/pants/issues/18664")
+    @pytest.mark.no_error_if_skipped
     def test_pantsd_invalidation_pants_toml_file(self):
         # Test tmp_pants_toml (--pants-config-files=$tmp_pants_toml)'s removal
         tmp_pants_toml = os.path.abspath("testprojects/test_pants.toml")
@@ -381,7 +385,10 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
         with self.pantsd_successful_run_context() as ctx:
             ctx.runner([f"--pants-config-files={tmp_pants_toml}", "help"])
             ctx.checker.assert_started()
-            time.sleep(10)
+            # This accounts for the amount of time it takes for the SchedulerService to begin watching
+            # these files. That happens asynchronously after `pantsd` startup, and may take a long
+            # time in a heavily loaded test environment.
+            time.sleep(15)
 
             # Delete tmp_pants_toml
             os.unlink(tmp_pants_toml)
@@ -517,7 +524,7 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
         :param signum: The signal to send.
         :param regexps: Assert that all of these regexps match somewhere in stderr.
         :param not_regexps: Assert that all of these regexps do not match somewhere in stderr.
-        :param cleanup_wait_time: passed throught to waiter, dictated how long simulated cleanup will take
+        :param cleanup_wait_time: passed through to waiter, dictated how long simulated cleanup will take
         """
         with self.pantsd_test_context() as (workdir, config, checker):
             client_handle, waiter_pid, child_pid, _ = launch_waiter(
@@ -554,7 +561,7 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
             checker.assert_running()
 
     def test_pantsd_graceful_shutdown(self):
-        """Test that SIGINT is propgated to child processes and they are given time to shutdown."""
+        """Test that SIGINT is propagated to child processes and they are given time to shutdown."""
         self._assert_pantsd_keyboardinterrupt_signal(
             signal.SIGINT,
             regexps=[
@@ -585,7 +592,7 @@ class TestPantsDaemonIntegration(PantsDaemonIntegrationTestBase):
     def test_sigint_kills_request_waiting_for_lock(self):
         """Test that, when a pailgun request is blocked waiting for another one to end, sending
         SIGINT to the blocked run will kill it."""
-        config = {"GLOBAL": {"pantsd_timeout_when_multiple_invocations": -1, "level": "debug"}}
+        config = {"GLOBAL": {"pantsd_timeout_when_multiple_invocations": -1.0, "level": "debug"}}
         with self.pantsd_test_context(extra_config=config) as (workdir, config, checker):
             # Run a process that will wait forever.
             first_run_handle, _, _, file_to_create = launch_waiter(workdir=workdir, config=config)

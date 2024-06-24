@@ -31,7 +31,6 @@ from pants.engine.target import (
 )
 from pants.util.dirutil import fast_relpath_optional
 from pants.util.docutil import doc_url
-from pants.util.meta import frozen_after_init
 from pants.util.strutil import softwrap
 
 logger = logging.getLogger(__name__)
@@ -74,7 +73,7 @@ async def isolate_local_dist_wheels(
                 code will be used directly from sources, without a distribution being built,
                 and any native extensions in it will not be built.
 
-                See {doc_url('python-distributions')} for details on how to set up a
+                See {doc_url('docs/python/overview/building-distributions')} for details on how to set up a
                 {tgt.target.alias} target to produce a wheel.
                 """
             )
@@ -99,16 +98,16 @@ async def isolate_local_dist_wheels(
     )
     provided_files = set(wheels_listing_result.stdout.decode().splitlines())
 
-    return LocalDistWheels(tuple(wheels), wheels_snapshot.digest, frozenset(provided_files))
+    return LocalDistWheels(
+        tuple(sorted(wheels)), wheels_snapshot.digest, frozenset(sorted(provided_files))
+    )
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class LocalDistsPexRequest:
     """Request to build the local dists from the dependency closure of a set of addresses."""
 
     addresses: Addresses
-    internal_only: bool
     interpreter_constraints: InterpreterConstraints
     # The result will return these with the sources provided by the dists subtracted out.
     # This will help the caller prevent sources from appearing twice on sys.path.
@@ -118,14 +117,12 @@ class LocalDistsPexRequest:
         self,
         addresses: Iterable[Address],
         *,
-        internal_only: bool,
-        interpreter_constraints: InterpreterConstraints = InterpreterConstraints(),
+        interpreter_constraints: InterpreterConstraints,
         sources: PythonSourceFiles = PythonSourceFiles.empty(),
     ) -> None:
-        self.addresses = Addresses(addresses)
-        self.internal_only = internal_only
-        self.interpreter_constraints = interpreter_constraints
-        self.sources = sources
+        object.__setattr__(self, "addresses", Addresses(addresses))
+        object.__setattr__(self, "interpreter_constraints", interpreter_constraints)
+        object.__setattr__(self, "sources", sources)
 
 
 @dataclass(frozen=True)
@@ -187,7 +184,9 @@ async def build_local_dists(
             requirements=PexRequirements(wheels),
             interpreter_constraints=request.interpreter_constraints,
             additional_inputs=wheels_digest,
-            internal_only=request.internal_only,
+            # a "local dists" PEX is always just for consumption by some downstream Pants process,
+            # i.e. internal
+            internal_only=True,
             additional_args=["--intransitive"],
         ),
     )

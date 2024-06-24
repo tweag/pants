@@ -10,14 +10,13 @@ Active Maintainers
 * Dan Moran
 * Daniel McClanahan
 * Daniel Wagner-Hall
-* Eric Arellano
 * Henry Fuller
-* John Sirois
 * Joshua Cannon
 * Kris Wilson
 * Patrick Lawson
 * Stu Hood
 * Suresh Joshi (SJ)
+* Tobias Nilsson
 * Tom Dyas
 * Yi Cheng
 
@@ -31,11 +30,13 @@ Emeritus
 * David Taylor
 * David Turner
 * Dorothy Ordogh
+* Eric Arellano
 * Eric Ayers
 * Fedor Korotkov
 * Garrett Malmquist
 * Greg Shuflin
 * Ity Kaul
+* John Sirois
 * Larry Hosken
 * Mateo Rodriguez
 * Matt Olsen

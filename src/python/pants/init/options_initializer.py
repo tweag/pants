@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import logging
 import sys
 from contextlib import contextmanager
-from typing import Iterator
+from pathlib import Path
+from typing import Iterator, List
 
 import pkg_resources
 
@@ -28,6 +30,7 @@ from pants.option.errors import UnknownFlagsError
 from pants.option.global_options import DynamicRemoteOptions
 from pants.option.options import Options
 from pants.option.options_bootstrapper import OptionsBootstrapper
+from pants.util.requirements import parse_requirements_file
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +43,20 @@ def _initialize_build_configuration(
     """Initialize a BuildConfiguration for the given OptionsBootstrapper.
 
     NB: This method:
-      1. has the side-effect of (idempotently) adding PYTHONPATH entries for this process
+      1. has the side effect of (idempotently) adding PYTHONPATH entries for this process
       2. is expensive to call, because it might resolve plugins from the network
     """
 
     bootstrap_options = options_bootstrapper.get_bootstrap_options().for_global_scope()
-    working_set = plugin_resolver.resolve(options_bootstrapper, env)
 
     # Add any extra paths to python path (e.g., for loading extra source backends).
     for path in bootstrap_options.pythonpath:
         if path not in sys.path:
             sys.path.append(path)
             pkg_resources.fixup_namespace_packages(path)
+
+    backends_requirements = _collect_backends_requirements(bootstrap_options.backend_packages)
+    working_set = plugin_resolver.resolve(options_bootstrapper, env, backends_requirements)
 
     # Load plugins and backends.
     return load_backends_and_plugins(
@@ -61,8 +66,46 @@ def _initialize_build_configuration(
     )
 
 
+def _collect_backends_requirements(backends: List[str]) -> List[str]:
+    """Collects backend package dependencies, in case those are declared in an adjacent
+    requirements.txt. Ignores any loading errors, assuming those will be later on handled by the
+    backends loader.
+
+    :param backends: An list of packages to load v2 backends requirements from.
+    """
+    requirements = []
+
+    for backend_package in backends:
+        try:
+            backend_package_spec = importlib.util.find_spec(backend_package)
+        except ModuleNotFoundError:
+            continue
+
+        if backend_package_spec is None:
+            continue
+
+        if backend_package_spec.origin is None:
+            logger.warning(
+                f"Can not check requirements for backend: '{backend_package}'. A __init__.py file is probably missing."
+            )
+            continue
+
+        requirements_txt_file_path = Path(backend_package_spec.origin).parent.joinpath(
+            "requirements.txt"
+        )
+        if requirements_txt_file_path.exists():
+            content = requirements_txt_file_path.read_text()
+            backend_package_requirements = [
+                str(r)
+                for r in parse_requirements_file(content, rel_path=str(requirements_txt_file_path))
+            ]
+            requirements.extend(backend_package_requirements)
+
+    return requirements
+
+
 def create_bootstrap_scheduler(
-    options_bootstrapper: OptionsBootstrapper, executor: PyExecutor | None = None
+    options_bootstrapper: OptionsBootstrapper, executor: PyExecutor
 ) -> BootstrapScheduler:
     bc_builder = BuildConfiguration.Builder()
     # To load plugins, we only need access to the Python/PEX rules.
@@ -77,7 +120,7 @@ def create_bootstrap_scheduler(
             bc_builder.create(),
             DynamicRemoteOptions.disabled(),
             executor,
-            ignore_unrecognized_build_file_symbols=True,
+            is_bootstrap=True,
         ).scheduler
     )
 
@@ -98,7 +141,7 @@ class OptionsInitializer:
     def __init__(
         self,
         options_bootstrapper: OptionsBootstrapper,
-        executor: PyExecutor | None = None,
+        executor: PyExecutor,
     ) -> None:
         self._bootstrap_scheduler = create_bootstrap_scheduler(options_bootstrapper, executor)
         self._plugin_resolver = PluginResolver(self._bootstrap_scheduler)

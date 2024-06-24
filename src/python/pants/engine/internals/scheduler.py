@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import PurePath
 from types import CoroutineType
-from typing import Any, Dict, Iterable, NoReturn, Sequence, cast
+from typing import Any, Callable, Dict, Iterable, NoReturn, Sequence, cast
 
 from typing_extensions import TypedDict
 
@@ -22,19 +22,25 @@ from pants.engine.fs import (
     DigestEntries,
     DigestSubset,
     Directory,
-    DownloadFile,
     FileContent,
     FileDigest,
     FileEntry,
+    NativeDownloadFile,
     PathGlobs,
     PathGlobsAndRoot,
+    PathMetadataRequest,
+    PathMetadataResult,
     Paths,
     Snapshot,
     SymlinkEntry,
 )
-from pants.engine.goal import Goal
+from pants.engine.goal import CurrentExecutingGoals, Goal
 from pants.engine.internals import native_engine
 from pants.engine.internals.docker import DockerResolveImageRequest, DockerResolveImageResult
+from pants.engine.internals.native_dep_inference import (
+    NativeParsedJavascriptDependencies,
+    NativeParsedPythonDependencies,
+)
 from pants.engine.internals.native_engine import (
     PyExecutionRequest,
     PyExecutionStrategyOptions,
@@ -148,6 +154,8 @@ class Scheduler:
         # Create the native Scheduler and Session.
         types = PyTypes(
             paths=Paths,
+            path_metadata_request=PathMetadataRequest,
+            path_metadata_result=PathMetadataResult,
             file_content=FileContent,
             file_entry=FileEntry,
             symlink_entry=SymlinkEntry,
@@ -157,7 +165,7 @@ class Scheduler:
             path_globs=PathGlobs,
             create_digest=CreateDigest,
             digest_subset=DigestSubset,
-            download_file=DownloadFile,
+            native_download_file=NativeDownloadFile,
             platform=Platform,
             process=Process,
             process_result=FallibleProcessResult,
@@ -170,27 +178,32 @@ class Scheduler:
             engine_aware_parameter=EngineAwareParameter,
             docker_resolve_image_request=DockerResolveImageRequest,
             docker_resolve_image_result=DockerResolveImageResult,
+            parsed_python_deps_result=NativeParsedPythonDependencies,
+            parsed_javascript_deps_result=NativeParsedJavascriptDependencies,
         )
         remoting_options = PyRemotingOptions(
+            provider=execution_options.remote_provider.value,
             execution_enable=execution_options.remote_execution,
+            store_headers=execution_options.remote_store_headers,
+            store_chunk_bytes=execution_options.remote_store_chunk_bytes,
+            store_rpc_retries=execution_options.remote_store_rpc_retries,
+            store_rpc_concurrency=execution_options.remote_store_rpc_concurrency,
+            store_rpc_timeout_millis=execution_options.remote_store_rpc_timeout_millis,
+            store_batch_api_size_limit=execution_options.remote_store_batch_api_size_limit,
+            cache_warnings_behavior=execution_options.remote_cache_warnings.value,
+            cache_content_behavior=execution_options.cache_content_behavior.value,
+            cache_rpc_concurrency=execution_options.remote_cache_rpc_concurrency,
+            cache_rpc_timeout_millis=execution_options.remote_cache_rpc_timeout_millis,
+            execution_headers=execution_options.remote_execution_headers,
+            execution_overall_deadline_secs=execution_options.remote_execution_overall_deadline_secs,
+            execution_rpc_concurrency=execution_options.remote_execution_rpc_concurrency,
             store_address=execution_options.remote_store_address,
             execution_address=execution_options.remote_execution_address,
             execution_process_cache_namespace=execution_options.process_execution_cache_namespace,
             instance_name=execution_options.remote_instance_name,
             root_ca_certs_path=execution_options.remote_ca_certs_path,
-            store_headers=execution_options.remote_store_headers,
-            store_chunk_bytes=execution_options.remote_store_chunk_bytes,
-            store_chunk_upload_timeout=execution_options.remote_store_chunk_upload_timeout_seconds,
-            store_rpc_retries=execution_options.remote_store_rpc_retries,
-            store_rpc_concurrency=execution_options.remote_store_rpc_concurrency,
-            store_batch_api_size_limit=execution_options.remote_store_batch_api_size_limit,
-            cache_warnings_behavior=execution_options.remote_cache_warnings.value,
-            cache_content_behavior=execution_options.cache_content_behavior.value,
-            cache_rpc_concurrency=execution_options.remote_cache_rpc_concurrency,
-            cache_read_timeout_millis=execution_options.remote_cache_read_timeout_millis,
-            execution_headers=execution_options.remote_execution_headers,
-            execution_overall_deadline_secs=execution_options.remote_execution_overall_deadline_secs,
-            execution_rpc_concurrency=execution_options.remote_execution_rpc_concurrency,
+            client_certs_path=execution_options.remote_client_certs_path,
+            client_key_path=execution_options.remote_client_key_path,
             append_only_caches_base_path=execution_options.remote_execution_append_only_caches_base_path,
         )
         py_local_store_options = PyLocalStoreOptions(
@@ -201,7 +214,7 @@ class Scheduler:
             lease_time_millis=LOCAL_STORE_LEASE_TIME_SECS * 1000,
             shard_count=local_store_options.shard_count,
         )
-        exec_stategy_opts = PyExecutionStrategyOptions(
+        exec_strategy_opts = PyExecutionStrategyOptions(
             local_cache=execution_options.local_cache,
             remote_cache_read=execution_options.remote_cache_read,
             remote_cache_write=execution_options.remote_cache_write,
@@ -214,6 +227,7 @@ class Scheduler:
             graceful_shutdown_timeout=execution_options.process_execution_graceful_shutdown_timeout,
         )
 
+        self._py_executor = executor
         self._py_scheduler = native_engine.scheduler_create(
             executor,
             tasks,
@@ -221,13 +235,13 @@ class Scheduler:
             build_root,
             local_execution_root_dir,
             named_caches_dir,
-            ca_certs_path,
             ignore_patterns,
             use_gitignore,
             watch_filesystem,
             remoting_options,
             py_local_store_options,
-            exec_stategy_opts,
+            exec_strategy_opts,
+            ca_certs_path,
         )
 
         # If configured, visualize the rule graph before asserting that it is valid.
@@ -241,6 +255,10 @@ class Scheduler:
     @property
     def py_scheduler(self) -> PyScheduler:
         return self._py_scheduler
+
+    @property
+    def py_executor(self) -> PyExecutor:
+        return self._py_executor
 
     def _to_params_list(self, subject_or_params: Any | Params) -> Sequence[Any]:
         if isinstance(subject_or_params, Params):
@@ -349,6 +367,7 @@ class SchedulerSession:
     def __init__(self, scheduler: Scheduler, session: PySession) -> None:
         self._scheduler = scheduler
         self._py_session = session
+        self._goals = session.session_values.get(CurrentExecutingGoals) or CurrentExecutingGoals()
 
     @property
     def scheduler(self) -> Scheduler:
@@ -389,6 +408,9 @@ class SchedulerSession:
 
     def visualize_rule_graph_to_file(self, filename: str) -> None:
         self._scheduler.visualize_rule_graph_to_file(filename)
+
+    def rule_graph_rule_gets(self) -> dict[Callable, list[tuple[type, list[type], Callable]]]:
+        return native_engine.rule_graph_rule_gets(self.py_scheduler)
 
     def execution_request(
         self,
@@ -534,7 +556,10 @@ class SchedulerSession:
                 [type(p) for p in params],
                 product,
             )
-        (return_value,) = self.product_request(product, [subject], poll=poll, poll_delay=poll_delay)
+        with self._goals._execute(product):
+            (return_value,) = self.product_request(
+                product, [subject], poll=poll, poll_delay=poll_delay
+            )
         return cast(int, return_value.exit_code)
 
     def product_request(
@@ -597,14 +622,18 @@ class SchedulerSession:
     def ensure_directory_digest_persisted(self, digest: Digest) -> None:
         native_engine.ensure_directory_digest_persisted(self.py_scheduler, digest)
 
-    def write_digest(self, digest: Digest, *, path_prefix: str | None = None) -> None:
+    def write_digest(
+        self, digest: Digest, *, path_prefix: str | None = None, clear_paths: Sequence[str] = ()
+    ) -> None:
         """Write a digest to disk, relative to the build root."""
         if path_prefix and PurePath(path_prefix).is_absolute():
             raise ValueError(
                 f"The `path_prefix` {path_prefix} must be a relative path, as the engine writes "
                 "the digest relative to the build root."
             )
-        native_engine.write_digest(self.py_scheduler, self.py_session, digest, path_prefix or "")
+        native_engine.write_digest(
+            self.py_scheduler, self.py_session, digest, path_prefix or "", clear_paths
+        )
 
     def lease_files_in_graph(self) -> None:
         native_engine.lease_files_in_graph(self.py_scheduler, self.py_session)
@@ -641,9 +670,9 @@ def register_rules(rule_index: RuleIndex, union_membership: UnionMembership) -> 
             tasks,
             rule.func,
             rule.output_type,
-            rule.input_selectors,
+            tuple(rule.parameters.items()),
             rule.masked_types,
-            side_effecting=any(issubclass(t, SideEffecting) for t in rule.input_selectors),
+            side_effecting=any(issubclass(t, SideEffecting) for t in rule.parameters.values()),
             engine_aware_return_type=issubclass(rule.output_type, EngineAwareReturnType),
             cacheable=rule.cacheable,
             name=rule.canonical_name,
@@ -651,8 +680,8 @@ def register_rules(rule_index: RuleIndex, union_membership: UnionMembership) -> 
             level=rule.level.level,
         )
 
-        for the_get in rule.input_gets:
-            unions = [t for t in the_get.input_types if is_union(t)]
+        for awaitable in rule.awaitables:
+            unions = [t for t in awaitable.input_types if is_union(t)]
             if len(unions) == 1:
                 # Register the union by recording a copy of the Get for each union member.
                 union = unions[0]
@@ -661,17 +690,26 @@ def register_rules(rule_index: RuleIndex, union_membership: UnionMembership) -> 
                 for union_member in union_membership.get(union):
                     native_engine.tasks_add_get_union(
                         tasks,
-                        the_get.output_type,
-                        tuple(union_member if t == union else t for t in the_get.input_types),
+                        awaitable.output_type,
+                        tuple(union_member if t == union else t for t in awaitable.input_types),
                         in_scope_types,
                     )
             elif len(unions) > 1:
                 raise TypeError(
-                    "Only one @union may be used in a Get, but {the_get} used: {unions}."
+                    "Only one @union may be used in a Get, but {awaitable} used: {unions}."
+                )
+            elif awaitable.rule_id is not None:
+                # Is a call to a known rule.
+                native_engine.tasks_add_call(
+                    tasks,
+                    awaitable.output_type,
+                    awaitable.input_types,
+                    awaitable.rule_id,
+                    awaitable.explicit_args_arity,
                 )
             else:
                 # Otherwise, the Get subject is a "concrete" type, so add a single Get edge.
-                native_engine.tasks_add_get(tasks, the_get.output_type, the_get.input_types)
+                native_engine.tasks_add_get(tasks, awaitable.output_type, awaitable.input_types)
 
         native_engine.tasks_task_end(tasks)
 

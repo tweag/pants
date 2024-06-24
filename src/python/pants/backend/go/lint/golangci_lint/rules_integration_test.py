@@ -27,7 +27,6 @@ from pants.backend.go.util_rules import (
 from pants.core.goals.lint import LintResult, Partitions
 from pants.core.util_rules import config_files, external_tool, source_files, system_binaries
 from pants.engine.addresses import Address
-from pants.engine.rules import SubsystemRule
 from pants.engine.target import Target
 from pants.testutil.rule_runner import QueryRule, RuleRunner
 
@@ -54,7 +53,7 @@ def rule_runner() -> RuleRunner:
             *third_party_pkg.rules(),
             QueryRule(Partitions, [GolangciLintRequest.PartitionRequest]),
             QueryRule(LintResult, [GolangciLintRequest.Batch]),
-            SubsystemRule(GolangciLint),
+            *GolangciLint.rules(),
         ],
     )
     rule_runner.set_options([], env_inherit={"PATH"})
@@ -139,7 +138,7 @@ def test_failing(rule_runner: RuleRunner) -> None:
             "BUILD": "go_mod(name='mod')\ngo_package(name='pkg')\n",
         }
     )
-    tgt = rule_runner.get_target((Address("", target_name="pkg")))
+    tgt = rule_runner.get_target(Address("", target_name="pkg"))
     lint_results = run_golangci_lint(rule_runner, [tgt])
     assert len(lint_results) == 1
     assert lint_results[0].exit_code == 1

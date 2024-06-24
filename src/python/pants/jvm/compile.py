@@ -36,9 +36,8 @@ from pants.engine.unions import UnionMembership, union
 from pants.jvm.resolve.key import CoursierResolveKey
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
-from pants.util.meta import frozen_after_init
 from pants.util.ordered_set import FrozenOrderedSet
-from pants.util.strutil import strip_v2_chroot_path
+from pants.util.strutil import Simplifier
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +138,8 @@ class ClasspathEntryRequestFactory:
             if set(partial[0].field_sets).issubset(set(consume_only[0].field_sets_consume_only)):
                 return partial[0](component, resolve, consume_only[0](component, resolve, None))
 
-        impls_str = ", ".join(sorted(impl.__name__ for impl in impls))
         if compatible:
+            impls_str = ", ".join(sorted(impl.__name__ for impl in compatible))
             raise ClasspathSourceAmbiguity(
                 f"More than one JVM classpath provider ({impls_str}) was compatible with "
                 f"the inputs:\n{component.bullet_list()}"
@@ -149,6 +148,7 @@ class ClasspathEntryRequestFactory:
             # TODO: There is more subtlety of error messages possible here if there are multiple
             # partial providers, but can cross that bridge when we have them (multiple Scala or Java
             # compiler implementations, for example).
+            impls_str = ", ".join(sorted(impl.__name__ for impl in impls))
             raise ClasspathSourceMissing(
                 f"No JVM classpath providers (from: {impls_str}) were compatible with the "
                 f"combination of inputs:\n{component.bullet_list()}"
@@ -217,8 +217,7 @@ def calculate_jvm_request_types(union_membership: UnionMembership) -> ClasspathE
     return ClasspathEntryRequestFactory(tuple(cpe_impls), sources_by_impl)
 
 
-@frozen_after_init
-@dataclass(unsafe_hash=True)
+@dataclass(frozen=True)
 class ClasspathEntry:
     """A JVM classpath entry represented as a series of JAR files, and their dependencies.
 
@@ -250,9 +249,9 @@ class ClasspathEntry:
         filenames: Iterable[str] = (),
         dependencies: Iterable[ClasspathEntry] = (),
     ):
-        self.digest = digest
-        self.filenames = tuple(filenames)
-        self.dependencies = FrozenOrderedSet(dependencies)
+        object.__setattr__(self, "digest", digest)
+        object.__setattr__(self, "filenames", tuple(filenames))
+        object.__setattr__(self, "dependencies", FrozenOrderedSet(dependencies))
 
     @classmethod
     def merge(cls, digest: Digest, entries: Iterable[ClasspathEntry]) -> ClasspathEntry:
@@ -340,19 +339,16 @@ class FallibleClasspathEntry(EngineAwareReturnType):
         process_result: FallibleProcessResult,
         output: ClasspathEntry | None,
         *,
-        strip_chroot_path: bool = False,
+        output_simplifier: Simplifier = Simplifier(),
     ) -> FallibleClasspathEntry:
-        def prep_output(s: bytes) -> str:
-            return strip_v2_chroot_path(s) if strip_chroot_path else s.decode()
-
         exit_code = process_result.exit_code
-        stderr = prep_output(process_result.stderr)
+        stderr = output_simplifier.simplify(process_result.stderr)
         return cls(
             description=description,
             result=(CompileResult.SUCCEEDED if exit_code == 0 else CompileResult.FAILED),
             output=output,
             exit_code=exit_code,
-            stdout=prep_output(process_result.stdout),
+            stdout=output_simplifier.simplify(process_result.stdout),
             stderr=stderr,
         )
 

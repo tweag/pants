@@ -13,9 +13,11 @@ from pants.backend.scala.dependency_inference.scala_parser import (
     ScalaSourceDependencyAnalysis,
 )
 from pants.backend.scala.target_types import ScalaSourceField, ScalaSourceTarget
+from pants.backend.scala.util_rules import versions
 from pants.build_graph.address import Address
 from pants.core.util_rules import source_files
 from pants.core.util_rules.source_files import SourceFilesRequest
+from pants.engine import process
 from pants.engine.target import SourcesField
 from pants.jvm import jdk_rules
 from pants.jvm import util_rules as jvm_util_rules
@@ -35,6 +37,8 @@ def rule_runner() -> RuleRunner:
             *jdk_rules.rules(),
             *target_types.rules(),
             *jvm_util_rules.rules(),
+            *process.rules(),
+            *versions.rules(),
             QueryRule(AnalyzeScalaSourceRequest, (SourceFilesRequest,)),
             QueryRule(ScalaSourceDependencyAnalysis, (AnalyzeScalaSourceRequest,)),
         ],
@@ -252,39 +256,39 @@ def test_parser_simple(rule_runner: RuleRunner) -> None:
             "org.pantsbuild.example.OuterObject": FrozenOrderedSet(["Foo"]),
             "org.pantsbuild.example.Functions": FrozenOrderedSet(
                 [
-                    "TupleTypeArg2",
-                    "foo",
-                    "TupleTypeArg1",
-                    "LambdaReturnType",
                     "+",
-                    "Unit",
-                    "Integer",
-                    "LambdaTypeArg2",
                     "AParameterType",
+                    "Integer",
+                    "LambdaReturnType",
                     "LambdaTypeArg1",
+                    "LambdaTypeArg2",
                     "OuterObject",
-                    "bar",
                     "OuterObject.NestedVal",
+                    "TupleTypeArg1",
+                    "TupleTypeArg2",
+                    "Unit",
+                    "bar",
+                    "foo",
                 ]
             ),
             "org.pantsbuild.example.HasPrimaryConstructor": FrozenOrderedSet(
-                ["bar", "SomeTypeInSecondaryConstructor"]
+                ["SomeTypeInSecondaryConstructor", "bar"]
             ),
             "org.pantsbuild.example.OuterClass": FrozenOrderedSet(["Foo"]),
             "org.pantsbuild.example.ApplyQualifier": FrozenOrderedSet(
-                ["Integer", "a", "toInt", "calc.calcFunc", "calc"]
+                ["Integer", "a", "calc", "calc.calcFunc", "toInt"]
             ),
             "org.pantsbuild.example.OuterTrait": FrozenOrderedSet(
-                ["Integer", "TraitConsumedType", "Foo"]
+                ["Foo", "Integer", "TraitConsumedType"]
             ),
             "org.pantsbuild.example": FrozenOrderedSet(
                 [
                     "ABaseClass",
                     "ATrait1",
-                    "SomeTypeInPrimaryConstructor",
-                    "foo",
                     "ATrait2.Nested",
                     "BaseWithConstructor",
+                    "SomeTypeInPrimaryConstructor",
+                    "foo",
                 ]
             ),
         }
@@ -429,6 +433,31 @@ def test_relative_import(rule_runner: RuleRunner) -> None:
         "sio",
         "sio.apply",
     }
+
+
+def test_import_root_pacjage(rule_runner: RuleRunner) -> None:
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """
+            package foo
+
+            import _root_.io.circe.syntax._
+
+            object Foo {
+                val foo: _root_.foo.Bar = ???
+            }
+            """
+        ),
+    )
+
+    assert analysis.imports_by_scope == FrozenDict(
+        {"foo": (ScalaImport(name="io.circe.syntax", alias=None, is_wildcard=True),)}
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Bar",
+    ]
 
 
 def test_package_object(rule_runner: RuleRunner) -> None:
@@ -595,6 +624,60 @@ def test_package_object_extends_trait(rule_runner: RuleRunner) -> None:
     assert sorted(analysis.fully_qualified_consumed_symbols()) == ["foo.Trait", "foo.bar.Trait"]
 
 
+def test_enum(rule_runner: RuleRunner) -> None:
+    rule_runner.set_options(
+        args=[
+            "-ldebug",
+            "--scala-version-for-resolve={'jvm-default':'3.3.0'}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """
+            package foo
+            enum Spam {
+                case Ham
+                case Eggs
+            }
+            """
+        ),
+    )
+
+    expected_symbols = [
+        ScalaProvidedSymbol("foo.Spam", False),
+        ScalaProvidedSymbol("foo.Spam.Eggs", False),
+        ScalaProvidedSymbol("foo.Spam.Ham", False),
+    ]
+
+    assert sorted(analysis.provided_symbols, key=lambda x: x.name) == expected_symbols
+
+
+def test_enum_use(rule_runner: RuleRunner) -> None:
+    rule_runner.set_options(
+        args=[
+            "-ldebug",
+            "--scala-version-for-resolve={'jvm-default':'3.3.0'}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """
+            package foo
+            enum Spam {
+                case Ham(x: Eggs)
+            }
+            """
+        ),
+    )
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == ["foo.Eggs"]
+
+
 def test_types_at_toplevel_package(rule_runner: RuleRunner) -> None:
     analysis = _analyze(
         rule_runner,
@@ -629,7 +712,7 @@ def test_types_at_toplevel_package(rule_runner: RuleRunner) -> None:
     )
 
 
-def test_type_constaint(rule_runner: RuleRunner) -> None:
+def test_type_constraint(rule_runner: RuleRunner) -> None:
     analysis = _analyze(
         rule_runner,
         textwrap.dedent(
@@ -676,4 +759,22 @@ def test_type_context_bounds(rule_runner: RuleRunner) -> None:
     assert sorted(analysis.fully_qualified_consumed_symbols()) == [
         "foo.Applicative",
         "foo.Functor",
+    ]
+
+
+def test_self_types_on_same_package(rule_runner: RuleRunner) -> None:
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """\
+            package foo
+
+            trait Bar { self: Foo =>
+            }
+            """
+        ),
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Foo",
     ]
